@@ -120,7 +120,6 @@
 | `TURNSTILE_SECRET_KEY` | `0x4AAAA...` | 步骤四获取的 Turnstile 密钥 |
 | `RECAPTCHA_SITE_KEY` | `6LAAAAABBCCDDBGHYDD_cDmgjUtEbpF` | [Google reCAPTCHA v2](https://www.google.com/recaptcha/admin) 站点密钥 |
 | `RECAPTCHA_SECRET_KEY` | `6LAAAAABDDCCFGTTH-AIMK6z-H4aE` | [Google reCAPTCHA v2](https://www.google.com/recaptcha/admin) 密钥 |
-| `TELEGRAM_WEBHOOK_SECRET` | `mRD0p7...` | 生成随机字符即可 |
 
 > ⚠️ **重要**：
 > - Google reCAPTCHA 需自行在 [Google reCAPTCHA Admin Console](https://www.google.com/recaptcha/admin) 创建（选择 **v2 Checkbox** 类型）
