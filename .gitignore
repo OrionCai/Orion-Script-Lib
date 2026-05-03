@@ -1,67 +1,144 @@
-######################
-# macOS
-######################
-.DS_Store
+# =======================================================================
+# 1. macOS 操作系统专属文件
+# 拦截苹果系统自动生成的桌面索引、缩略图、目录属性等污染文件
+# =======================================================================
+*.DS_Store
 .AppleDouble
 .LSOverride
 Icon
+
+# 网络驱动器和外部存储设备产生的隐藏文件
 ._*
+.DocumentRevisions-V100
+.fseventsd
 .Spotlight-V100
+.TemporaryItems
 .Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
 
-######################
-# IntelliJ IDEA
-######################
-# 忽略个人工作区配置（如窗口布局、历史记录）
-.idea/**/workspace.xml
-.idea/**/tasks.xml
-.idea/**/usage.statistics.xml
-.idea/**/dictionaries
-.idea/**/shelf
+# 处理 macOS 上的解压与目录缓存
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
 
-# 忽略数据库、本地数据源
-.idea/**/dataSources/
-.idea/**/dataSources.ids
-.idea/**/dataSources.local.xml
-.idea/**/sqlDataSources.xml
-.idea/**/dynamic.xml
-.idea/**/uiDesigner.xml
-.idea/**/dbnavigator.xml
-
-# 忽略模块文件（不强制提交 iml）
-*.iws
+# =======================================================================
+# 2. IntelliJ IDEA 与主流编辑器缓存
+# 拦截 IDE 本地工作区、缓存目录和个人 UI 配置
+# =======================================================================
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/usage.statistics.xml
+.idea/dictionaries
+.idea/shelf/
+.idea/compiler.xml
+.idea/jarRepositories.xml
+.idea/modules.xml
+.idea/vcs.xml
+.idea/misc.xml
+.idea/uiDesigner.xml
+.idea/jsLibraryMappings.xml
+# 拦截旧版 IDEA 和 Eclipse 文件
 *.iml
+*.iws
 *.ipr
+.classpath
+.project
+.settings/
+.metadata/
+# 拦截 VS Code 与 Vim 的本地缓存
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.swp
+*.swo
+*~
 
-# IDEA 缓存
-out/
-
-######################
-# Java 编译输出
-######################
+# =======================================================================
+# 3. Java 编译输出与运行日志
+# 拦截所有编译生成的字节码、打包归档文件以及运行崩溃报告
+# =======================================================================
 *.class
 *.log
-*.ctxt
+*.jar
+*.war
+*.nar
+*.ear
+*.zip
+*.tar.gz
+*.rar
+# JVM 崩溃日志
 hs_err_pid*
 replay_pid*
+# Tomcat/服务器产生的日志和临时目录
+logs/
+temp/
+work/
 
-######################
-# Maven
-######################
-target/
-
-######################
-# Gradle
-######################
-.gradle
+# =======================================================================
+# 4. Gradle 构建系统
+# 过滤 Gradle 本地缓存、守护进程记录和构建产物
+# =======================================================================
+.gradle/
 build/
+# 忽略个人本地的属性配置（绝不能提交带有私钥的 local.properties）
+local.properties
+# 务必保留 Wrapper 运行必需的 jar 包和配置文件
 !gradle/wrapper/gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.properties
 
-######################
-# 其他临时目录
-######################
-bin/
-gen/
+# =======================================================================
+# 5. Maven 构建系统
+# 过滤 Maven 目标输出和发布插件产生的临时备份文件
+# =======================================================================
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+.mvn/timing.properties
+# 同样务必保留 Maven Wrapper 必需的文件
+!.mvn/wrapper/maven-wrapper.jar
+
+# =======================================================================
+# 6. 前端构建与依赖 (Node.js/NPM/Yarn/pnpm)
+# 防止海量的 node_modules 模块和构建工具报错日志进入版本库
+# =======================================================================
+node_modules/
 dist/
-release/
-tmp/
+dist-ssr/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+# 框架打包输出
+.next/
+.nuxt/
+.vuepress/dist/
+.serverless/
+coverage/
+
+# =======================================================================
+# 7. 运维、Docker与环境配置
+# 防止云原生环境中的密钥、环境变量泄露
+# =======================================================================
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+# 过滤 Docker 和其他虚拟化工具的缓存
+.dockerignore
+docker-compose.override.yml
+# SSL 证书和私钥绝不入库
+*.pem
+*.crt
+*.key
