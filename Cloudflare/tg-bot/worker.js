@@ -132,6 +132,14 @@ async function setCfg(key, val, env) {
     if (key === 'authorized_admins') CACHE.admin.ts = 0;
 }
 
+// 删除配置项：同步失效缓存，避免旧值被 getCfg 误读
+async function deleteCfg(key, env) {
+    await sql(env, "DELETE FROM config WHERE key=?", key);
+    delete CACHE.data[key];
+    CACHE.ts = 0;
+    if (key === 'authorized_admins') CACHE.admin.ts = 0;
+}
+
 // 获取或初始化用户信息实体
 async function getUser(id, env) {
     let u = await sql(env, "SELECT * FROM users WHERE user_id = ?", id, 'first');
@@ -514,12 +522,17 @@ async function sendStart(id, msg, env) {
             parse_mode: "HTML",
             reply_markup: { inline_keyboard: [[{ text: "点击进行验证", web_app: { url: `${url}/verify?user_id=${encodeURIComponent(id)}&nonce=${encodeURIComponent(nonce)}` } }]] }
         });
-    } else if (!isCaptchaOn && isQAOn) {
+    } else if (isQAOn) {
         await updUser(id, { user_state: "pending_verification" }, env);
         return api(env.BOT_TOKEN, "sendMessage", {
             chat_id: id,
             text: "❓ <b>安全提问</b>\n请回答：\n" + await getCfg('verif_q', env),
             parse_mode: "HTML"
+        });
+    } else if (isCaptchaOn || isQAOn) {
+        return api(env.BOT_TOKEN, "sendMessage", {
+            chat_id: id,
+            text: "⚠️ 验证功能暂时不可用，请联系管理员检查配置"
         });
     }
 }
@@ -715,7 +728,7 @@ async function relayToTopic(msg, u, env) {
         if (e.message && (e.message.includes("thread") || e.message.includes("not found") || e.message.includes("Bad Request"))) {
             await updUser(uid, { topic_id: null }, env); u.topic_id = null; return relayToTopic(msg, u, env);
         } else {
-            api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "❌ 发送失败，系统异常" });
+            await api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "❌ 发送失败，系统异常" });
         }
     }
 }
@@ -801,7 +814,7 @@ async function handleBackup(msg, meta, env) {
     if (!bid) return;
     try {
         const header = `<b>📨 备份</b> ${meta.name} (${meta.userId})`;
-        if (msg.text) await api(env.BOT_TOKEN, "sendMessage", { chat_id: bid, text: header + "\n" + msg.text, parse_mode: "HTML" });
+        if (msg.text) await api(env.BOT_TOKEN, "sendMessage", { chat_id: bid, text: header + "\n" + escape(msg.text), parse_mode: "HTML" });
         else {
             await api(env.BOT_TOKEN, "sendMessage", { chat_id: bid, text: header, parse_mode: "HTML" });
             await api(env.BOT_TOKEN, "copyMessage", { chat_id: bid, from_chat_id: msg.chat.id, message_id: msg.message_id });
@@ -832,7 +845,7 @@ async function handleAdminReply(msg, env) {
                 }
             }
             await updUser(targetUid, { user_info: u.user_info }, env);
-            await setCfg(`admin_state:${msg.from.id}`, "", env);
+            await deleteCfg(`admin_state:${msg.from.id}`, env);
             return api(env.BOT_TOKEN, "sendMessage", { chat_id: msg.chat.id, message_thread_id: msg.message_thread_id, text: `✅ 备注已更新` });
         }
     }
@@ -854,7 +867,7 @@ async function handleAdminReply(msg, env) {
                 [uid, sent.message_id.toString(), storeText, msg.date || Math.floor(Date.now() / 1000), msg.message_id.toString()]);
         }
         // 此处为管理员端给用户下发消息的主逻辑。根据之前的版本，管理员侧发送成功后的回执代码也已经去除
-    } catch (e) { api(env.BOT_TOKEN, "sendMessage", { chat_id: msg.chat.id, message_thread_id: msg.message_thread_id, text: "❌ 内部投递失败" }); }
+    } catch (e) { await api(env.BOT_TOKEN, "sendMessage", { chat_id: msg.chat.id, message_thread_id: msg.message_thread_id, text: "❌ 内部投递失败" }); }
 }
 
 async function handleEdit(msg, env) {
@@ -939,8 +952,15 @@ async function handleCallback(cb, env) {
         if (!msg || msg.chat.id.toString() !== env.ADMIN_GROUP_ID || !(await isAuthAdmin(from.id, env))) {
             return api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "无操作权限", show_alert: true });
         }
-        await setCfg(`admin_state:${from.id}`, JSON.stringify({ action: 'input_note', target: p2 }), env);
-        return api(env.BOT_TOKEN, "sendMessage", { chat_id: msg.chat.id, message_thread_id: msg.message_thread_id, text: "⌨️ 请回复备注内容 (回复 /clear 清除):" });
+        try {
+            await setCfg(`admin_state:${from.id}`, JSON.stringify({ action: 'input_note', target: p2 }), env);
+            await api(env.BOT_TOKEN, "sendMessage", { chat_id: msg.chat.id, message_thread_id: msg.message_thread_id, text: "⌨️ 请回复备注内容 (回复 /clear 清除):" });
+            return api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "请直接回复备注内容" });
+        } catch (e) {
+            console.error("Set Note State Failed:", e);
+            await deleteCfg(`admin_state:${from.id}`, env).catch(() => {});
+            return api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "操作失败，请重试", show_alert: true });
+        }
     }
 
     if (act === 'config') {
@@ -967,7 +987,7 @@ async function handleCallback(cb, env) {
             return api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "无操作权限", show_alert: true });
         }
         await api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id });
-        if (act === 'pin_card') api(env.BOT_TOKEN, "pinChatMessage", { chat_id: msg.chat.id, message_id: msg.message_id, message_thread_id: msg.message_thread_id });
+        if (act === 'pin_card') await api(env.BOT_TOKEN, "pinChatMessage", { chat_id: msg.chat.id, message_id: msg.message_id, message_thread_id: msg.message_thread_id });
         else if (['block','unblock'].includes(act)) {
             const isB = act === 'block'; const uid = p1; const u = await getUser(uid, env); const bid = await getCfg('blocked_topic_id', env);
             await updUser(uid, { is_blocked: isB, block_count: 0 }, env);
@@ -976,8 +996,8 @@ async function handleCallback(cb, env) {
                 api(env.BOT_TOKEN, "editMessageReplyMarkup", { chat_id: env.ADMIN_GROUP_ID, message_id: u.user_info.card_msg_id, reply_markup: getBtns(uid, isB, u.user_info.username) }).catch(()=>{});
             }
             await manageBlacklist(env, u, { id: uid, username: u.user_info.username, first_name: u.user_info.name }, isB);
-            if (!isB && msg.message_thread_id && bid && msg.message_thread_id.toString() === bid) api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "✅ 已解除屏蔽" });
-            else api(env.BOT_TOKEN, "sendMessage", { chat_id: msg.chat.id, message_thread_id: msg.message_thread_id, text: isB ? "❌ 已屏蔽" : "✅ 已解封" });
+            if (!isB && msg.message_thread_id && bid && msg.message_thread_id.toString() === bid) await api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "✅ 已解除屏蔽" });
+            else await api(env.BOT_TOKEN, "sendMessage", { chat_id: msg.chat.id, message_thread_id: msg.message_thread_id, text: isB ? "❌ 已屏蔽" : "✅ 已解封" });
         }
     }
 }
@@ -1017,7 +1037,11 @@ async function handleAdminConfig(cid, mid, type, key, val, env) {
             if (key === 'welcome_msg') promptText = `请发送新的欢迎语 (/cancel 取消):\n\n• 支持 <b>文字</b> 或 <b>图片/视频/GIF</b>\n• 支持占位符: {name}\n• 直接发送媒体即可`;
             return api(env.BOT_TOKEN, "editMessageText", { chat_id: cid, message_id: mid, text: promptText, parse_mode: "HTML" });
         }
-    } catch (e) { api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: mid, text: "Data Fetch Error", show_alert: true }); }
+    } catch (e) {
+        console.error("Admin Config Failed:", e);
+        await deleteCfg(`admin_state:${cid}`, env).catch(() => {});
+        return api(env.BOT_TOKEN, "sendMessage", { chat_id: cid, text: "❌ 面板加载失败，请稍后重试" });
+    }
 }
 
 async function getFilterKB(env) {
@@ -1038,7 +1062,7 @@ async function getListKB(type, env) {
 
 async function handleAdminInput(id, msg, state, env) {
     const txt = msg.text || "";
-    if (txt === '/cancel') { await sql(env, "DELETE FROM config WHERE key=?", `admin_state:${id}`); return handleAdminConfig(id, null, 'menu', null, null, env); }
+    if (txt === '/cancel') { await deleteCfg(`admin_state:${id}`, env); return handleAdminConfig(id, null, 'menu', null, null, env); }
     let k = state.key, val = txt;
     try {
         if (k === 'welcome_msg') {
@@ -1056,11 +1080,11 @@ async function handleAdminInput(id, msg, state, env) {
             else list.push(txt);
             val = JSON.stringify(list); k = realK;
         } else if (k === 'authorized_admins') { val = JSON.stringify(txt.split(/[,，]/).map(s => s.trim()).filter(Boolean)); }
-        await setCfg(k, val, env); await sql(env, "DELETE FROM config WHERE key=?", `admin_state:${id}`);
+        await setCfg(k, val, env); await deleteCfg(`admin_state:${id}`, env);
         const displayVal = (val.startsWith('{') && k === 'welcome_msg') ? "[媒体配置组合]" : val.substring(0,100);
         await api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: `✅ ${k} 规则已写入:\n${displayVal}` });
         await handleAdminConfig(id, null, 'menu', null, null, env);
-    } catch (e) { api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: `❌ 指令提交受阻: ${e.message}` }); }
+    } catch (e) { await api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: `❌ 指令提交受阻: ${e.message}` }); }
 }
 
 // --- 10. 工具函数池 (Pure Functions) ---
