@@ -809,7 +809,7 @@ async function relayToTopic(msg, u, env) {
         if (forwardedMsg && forwardedMsg.message_id) {
             const storeText = msg.text || "[Media]";
             await sql(env, "INSERT OR REPLACE INTO messages (user_id, message_id, text, date, topic_message_id) VALUES (?,?,?,?,?)",
-                [uid, msg.message_id, storeText, msg.date, forwardedMsg.message_id.toString()]);
+                [uid, msg.message_id.toString(), storeText, msg.date, forwardedMsg.message_id.toString()]);
         }
 
         // 下游归档链路：数据备份
@@ -1025,14 +1025,17 @@ async function handleTokenSubmit(req, env) {
             await api(env.BOT_TOKEN, "sendMessage", { chat_id: verifiedUserId, text: "✅ 验证通过！\n现在您可以直接发送消息，我会帮您转达给管理员。" });
         }
         return new Response(JSON.stringify({ success: true }));
-    } catch { return new Response(JSON.stringify({ success: false }), { status: 400 }); }
+    } catch (e) {
+        console.error("Token Submit Failed:", e);
+        return new Response(JSON.stringify({ success: false }), { status: 400 });
+    }
 }
 
 async function verifyAnswer(id, ans, env) {
     if (ans.trim() === (await getCfg('verif_a', env)).trim()) {
         await updUser(id, { user_state: "verified" }, env);
-        await api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "✅ 验证通过！\n现在您可以直接发送消息，我会帮您转达给管理员。" });
-    } else await api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "❌ 错误" });
+        return api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "✅ 验证通过！\n现在您可以直接发送消息，我会帮您转达给管理员。" });
+    } else return api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "❌ 错误" });
 }
 
 // --- 8. 菜单回调调度控制室 ---
