@@ -221,8 +221,10 @@ async function handleUpdate(update, env, ctx) {
     // 会话路由
     if (msg.chat.type === "private") await handlePrivate(msg, env, ctx);
     else if (msg.chat.id.toString() === env.ADMIN_GROUP_ID) {
-        // 检查是否是管理员的 /del 命令
-        if ((msg.text === "/del" || msg.caption === "/del") && msg.reply_to_message) {
+        const delCmd = parseDelCommand(msg.text || msg.caption || "");
+        if (delCmd === "all") {
+            await handleAdminDeleteAll(msg, env);
+        } else if (delCmd === "single" && msg.reply_to_message) {
             await handleAdminDelete(msg, env);
         } else {
             await handleAdminReply(msg, env);
@@ -340,11 +342,62 @@ async function handleUserDelete(msg, u, env) {
 async function handleAdminDelete(msg, env) {
     if (!msg.message_thread_id || !(await isAuthAdmin(msg.from.id, env))) return;
 
+    const text = msg.text || "";
+    // 解析 /del N 格式
+    const match = text.match(/^\/del\s+(\d+)$/i);
+    const count = match ? parseInt(match[1]) : 0;
+
+    // 场景 1: 批量删除最近 N 条
+    if (count > 0 && count <= 20) { // 限制单次最多删除 20 条以防 API 限流
+        const rows = await sql(env, "SELECT message_id, topic_message_id FROM messages WHERE user_id=(SELECT user_id FROM users WHERE topic_id=?) ORDER BY date DESC LIMIT ?",
+            [msg.message_thread_id.toString(), count], 'all');
+
+        if (!rows || !rows.results || rows.results.length === 0) {
+            return api(env.BOT_TOKEN, "sendMessage", {
+                chat_id: msg.chat.id,
+                message_thread_id: msg.message_thread_id,
+                text: "❌ 当前话题没有可删除的消息记录"
+            });
+        }
+
+        let deletedCount = 0;
+        for (const r of rows.results) {
+            try {
+                // 删除管理员侧消息
+                await api(env.BOT_TOKEN, "deleteMessage", {
+                    chat_id: msg.chat.id,
+                    message_id: parseInt(r.topic_message_id)
+                }).catch(() => {});
+
+                // 删除用户侧消息
+                await api(env.BOT_TOKEN, "deleteMessage", {
+                    chat_id: (await sql(env, "SELECT user_id FROM users WHERE topic_id=?", msg.message_thread_id.toString(), 'first')).user_id,
+                    message_id: parseInt(r.message_id)
+                }).catch(() => {});
+
+                deletedCount++;
+            } catch (e) { console.error("Batch Delete Error:", e); }
+        }
+
+        // 清理数据库记录
+        await sql(env, "DELETE FROM messages WHERE user_id=(SELECT user_id FROM users WHERE topic_id=?) AND rowid IN (SELECT rowid FROM messages WHERE user_id=(SELECT user_id FROM users WHERE topic_id=?) ORDER BY date DESC LIMIT ?)",
+            [msg.message_thread_id.toString(), msg.message_thread_id.toString(), count]);
+
+        // 删除触发命令本身
+        await api(env.BOT_TOKEN, "deleteMessage", {
+            chat_id: msg.chat.id,
+            message_id: msg.message_id
+        }).catch(() => {});
+
+        return; // 批量删除完成后直接返回，不发送额外提示以保持界面整洁
+    }
+
+    // 场景 2: 删除单条（回复模式）
     if (!msg.reply_to_message) {
         return api(env.BOT_TOKEN, "sendMessage", {
             chat_id: msg.chat.id,
             message_thread_id: msg.message_thread_id,
-            text: "⚠️ 请回复要删除的消息后使用 /del 命令"
+            text: "⚠️ 请回复要删除的消息后使用 /del 命令，或使用 /del N 删除最近 N 条"
         });
     }
 
@@ -392,6 +445,84 @@ async function handleAdminDelete(msg, env) {
     }
 }
 
+// 管理员侧批量删除：清空当前话题内用户会话消息（保留用户信息卡片）
+async function handleAdminDeleteAll(msg, env) {
+    if (!msg.message_thread_id) return;
+    if (!(await isPrimaryAdmin(msg.from.id, env))) {
+        return api(env.BOT_TOKEN, "sendMessage", {
+            chat_id: msg.chat.id,
+            message_thread_id: msg.message_thread_id,
+            text: "❌ 仅主管理员可使用 /del all"
+        });
+    }
+
+    const userRef = await sql(env, "SELECT user_id FROM users WHERE topic_id = ?", msg.message_thread_id.toString(), 'first');
+    if (!userRef?.user_id) {
+        return api(env.BOT_TOKEN, "sendMessage", {
+            chat_id: msg.chat.id,
+            message_thread_id: msg.message_thread_id,
+            text: "❌ 当前话题未绑定用户"
+        });
+    }
+
+    const u = await getUser(userRef.user_id, env);
+    const keepCardMsgId = u?.user_info?.card_msg_id ? parseInt(u.user_info.card_msg_id) : null;
+    const rows = await sql(env, "SELECT message_id, topic_message_id FROM messages WHERE user_id=?", [u.user_id], 'all');
+    const mapped = rows?.results || [];
+
+    let adminDeleted = 0;
+    let userDeleted = 0;
+
+    try {
+        // 删除管理员侧命令消息本身
+        await api(env.BOT_TOKEN, "deleteMessage", {
+            chat_id: msg.chat.id,
+            message_id: msg.message_id
+        }).catch(() => {});
+
+        for (const r of mapped) {
+            const topicMid = parseInt(r.topic_message_id);
+            const userMid = parseInt(r.message_id);
+
+            if (Number.isInteger(topicMid) && (!keepCardMsgId || topicMid !== keepCardMsgId)) {
+                await api(env.BOT_TOKEN, "deleteMessage", {
+                    chat_id: msg.chat.id,
+                    message_id: topicMid
+                }).then(() => { adminDeleted += 1; }).catch(() => {});
+            }
+
+            if (Number.isInteger(userMid)) {
+                await api(env.BOT_TOKEN, "deleteMessage", {
+                    chat_id: u.user_id,
+                    message_id: userMid
+                }).then(() => { userDeleted += 1; }).catch(() => {});
+            }
+        }
+
+        await sql(env, "DELETE FROM messages WHERE user_id=?", [u.user_id]);
+
+        const confirmMsg = await api(env.BOT_TOKEN, "sendMessage", {
+            chat_id: msg.chat.id,
+            message_thread_id: msg.message_thread_id,
+            text: `🧹 已清空当前话题消息\n管理员侧: ${adminDeleted} 条\n用户侧: ${userDeleted} 条\n（用户信息卡片已保留）`
+        }).catch(() => null);
+
+        if (confirmMsg?.message_id) {
+            await api(env.BOT_TOKEN, "deleteMessage", {
+                chat_id: msg.chat.id,
+                message_id: confirmMsg.message_id
+            }).catch(() => {});
+        }
+    } catch (e) {
+        console.error("Admin Delete All Failed:", e);
+        await api(env.BOT_TOKEN, "sendMessage", {
+            chat_id: msg.chat.id,
+            message_thread_id: msg.message_thread_id,
+            text: "❌ /del all 执行失败，请稍后重试"
+        }).catch(() => {});
+    }
+}
+
 // 私聊消息处理总线 (用户侧逻辑入口)
 async function handlePrivate(msg, env, ctx) {
     const id = msg.chat.id.toString();
@@ -427,7 +558,7 @@ async function handlePrivate(msg, env, ctx) {
         }
         return isAdm ? handleAdminConfig(id, null, 'menu', null, null, env) : sendStart(id, msg, env);
     }
-    if (text === "/help" && isAdm) return api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "ℹ️ <b>帮助</b>\n• 回复消息即对话\n• /start 打开面板\n• /del 删除消息", parse_mode: "HTML" });
+    if (text === "/help" && isAdm) return api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "ℹ️ <b>帮助</b>\n• 回复消息即对话\n• /start 打开面板\n• /del 删除单条消息\n• /del all 清空当前话题消息（仅主管理员）", parse_mode: "HTML" });
     if (text === "/del" && !isAdm) return handleUserDelete(msg, u, env);
 
     // 2. 封禁拦截层
@@ -1109,6 +1240,16 @@ async function getAdminSets(env) {
 
 const isPrimaryAdmin = async (id, e) => (await getAdminSets(e)).primary.has(id.toString());
 const isAuthAdmin = async (id, e) => (await getAdminSets(e)).auth.has(id.toString());
+
+function parseDelCommand(raw) {
+    const s = (raw || "").trim().toLowerCase();
+    if (!s.startsWith("/del")) return null;
+    const cmd = s.split(/\s+/, 2)[0];
+    if (!/^\/del(@[a-z0-9_]+)?$/i.test(cmd)) return null;
+    const rest = s.slice(cmd.length).trim();
+    if (!rest) return "single";
+    return rest === "all" ? "all" : null;
+}
 
 function safeRegexTest(pattern, text) {
     try {
