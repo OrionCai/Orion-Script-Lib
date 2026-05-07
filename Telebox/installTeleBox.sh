@@ -384,17 +384,7 @@ interactive_login() {
 write_pm2_wrapper() {
     local wrapper_file="$APP_DIR/ecosystem.local.cjs"
 
-    if [[ -f "$APP_DIR/ecosystem.config.cjs" ]]; then
-        cat > "$wrapper_file" <<EOF
-const config = require("./ecosystem.config.cjs");
-config.apps = (config.apps || []).map((app) => ({
-  ...app,
-  name: "$PM2_NAME",
-}));
-module.exports = config;
-EOF
-    else
-        cat > "$wrapper_file" <<EOF
+    cat > "$wrapper_file" <<EOF
 module.exports = {
   apps: [{
     name: "$PM2_NAME",
@@ -415,7 +405,6 @@ module.exports = {
   }]
 }
 EOF
-    fi
 }
 
 setup_pm2_startup() {
@@ -493,6 +482,8 @@ switch_login() {
     fi
 
     install_system_deps
+    ensure_app_repo
+    install_node_deps
     stop_instance
     clear_login_config
     interactive_login
