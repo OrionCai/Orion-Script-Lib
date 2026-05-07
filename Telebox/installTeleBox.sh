@@ -583,6 +583,7 @@ reset_all_and_install() {
         delete_pm2_instance
     done < <(list_all_instance_names)
 
+    cd "$HOME"
     rm -rf "$HOME/telebox" "$INSTANCE_BASE_DIR"
     set_instance "$DEFAULT_INSTANCE"
     install_or_update_instance
