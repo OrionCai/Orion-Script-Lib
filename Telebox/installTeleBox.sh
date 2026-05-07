@@ -330,7 +330,7 @@ try {
 NODE
 }
 
-clear_session() {
+clear_login_config() {
     local config_file="$APP_DIR/config.json"
     local backup_file="$APP_DIR/config.json.bak.$(date +%Y%m%d%H%M%S)"
 
@@ -347,9 +347,15 @@ const fs = require("node:fs");
 const file = process.argv[2];
 const config = JSON.parse(fs.readFileSync(file, "utf8"));
 delete config.session;
+delete config.api_id;
+delete config.api_hash;
+delete config.apiId;
+delete config.apiHash;
+delete config.API_ID;
+delete config.API_HASH;
 fs.writeFileSync(file, `${JSON.stringify(config, null, 2)}\n`);
 NODE
-    log_info "已清除 Telegram session，API_ID / API_HASH 会保留。"
+    log_info "已清除 Telegram session、API_ID 和 API_HASH。"
 }
 
 interactive_login() {
@@ -357,7 +363,7 @@ interactive_login() {
     cd "$APP_DIR"
 
     log_warn "即将进入 TeleBox 登录流程。"
-    log_warn "如需切换账号，请确认当前实例已清除旧 session。"
+    log_warn "如需切换账号，请确认当前实例已清除旧 API_ID / API_HASH / session。"
     log_warn "看到类似 '[INFO] - [Signed in successfully as xxx]' 后，按 CTRL+C 返回脚本。"
     echo -e "${C_GREEN}按 <回车键> 开始登录...${C_NC}"
     read -r
@@ -488,7 +494,7 @@ switch_login() {
 
     install_system_deps
     stop_instance
-    clear_session
+    clear_login_config
     interactive_login
     start_instance
 }
