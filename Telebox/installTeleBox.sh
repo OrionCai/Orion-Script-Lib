@@ -7,7 +7,7 @@ set -euo pipefail
 readonly NODE_VERSION="24"
 readonly GITHUB_REPO="${TELEBOX_REPO:-https://github.com/TeleBoxDev/TeleBox.git}"
 readonly GITHUB_BRANCH="${TELEBOX_BRANCH:-main}"
-readonly DEFAULT_INSTANCE="default"
+readonly DEFAULT_INSTANCE="telebox"
 readonly INSTANCE_BASE_DIR="${TELEBOX_BASE_DIR:-$HOME/telebox-instances}"
 
 readonly C_RED='\033[0;31m'
@@ -80,6 +80,9 @@ set_instance() {
     if [[ "$INSTANCE_NAME" == "$DEFAULT_INSTANCE" ]]; then
         APP_DIR="$HOME/telebox"
         PM2_NAME="telebox"
+    elif [[ "$INSTANCE_NAME" == telebox-* ]]; then
+        APP_DIR="$INSTANCE_BASE_DIR/$INSTANCE_NAME"
+        PM2_NAME="$INSTANCE_NAME"
     else
         APP_DIR="$INSTANCE_BASE_DIR/$INSTANCE_NAME"
         PM2_NAME="telebox-$INSTANCE_NAME"
@@ -205,7 +208,7 @@ instance_exists() {
 }
 
 generate_instance_name() {
-    local index=2
+    local index=1
     local candidate
 
     if ! instance_exists "$DEFAULT_INSTANCE"; then
@@ -214,7 +217,7 @@ generate_instance_name() {
     fi
 
     while true; do
-        candidate="instance${index}"
+        candidate=$(printf "telebox-%02d" "$index")
         if ! instance_exists "$candidate"; then
             echo "$candidate"
             return
@@ -531,7 +534,7 @@ usage() {
 用法:
   $0                         进入交互菜单
   $0 list                    列出本机实例
-  $0 install [instance]      安装或更新实例；instance 留空时自动生成
+  $0 install [instance]      安装或更新实例；留空时自动使用 telebox / telebox-01 / telebox-02...
   $0 login [instance]        切换该实例的 Telegram 登录账号
   $0 start [instance]        启动或重载实例
   $0 stop [instance]         停止实例
@@ -539,10 +542,12 @@ usage() {
   $0 status [instance]       查看实例状态
   $0 logs [instance]         查看实例日志
   $0 remove [instance]       删除实例目录和 PM2 进程
+  $0 reset                   删除所有实例后重新安装 telebox
 
 实例说明:
-  default 使用 $HOME/telebox 和 PM2 名称 telebox
-  其他实例使用 $INSTANCE_BASE_DIR/<instance> 和 PM2 名称 telebox-<instance>
+  telebox 使用 $HOME/telebox 和 PM2 名称 telebox
+  telebox-01 这类实例使用 $INSTANCE_BASE_DIR/<instance> 和同名 PM2 进程
+  其他自定义实例继续使用 PM2 名称 telebox-<instance>
 
 环境变量:
   TELEBOX_REPO=$GITHUB_REPO
@@ -551,17 +556,51 @@ usage() {
 EOF
 }
 
+list_all_instance_names() {
+    echo "$DEFAULT_INSTANCE"
+
+    if [[ -d "$INSTANCE_BASE_DIR" ]]; then
+        local dir
+        while IFS= read -r dir; do
+            basename "$dir"
+        done < <(find "$INSTANCE_BASE_DIR" -mindepth 1 -maxdepth 1 -type d | sort)
+    fi
+}
+
+reset_all_and_install() {
+    log_step "清空全部 TeleBox 实例并重新安装"
+    log_warn "这会删除以下内容："
+    log_warn "1. 默认实例目录：$HOME/telebox"
+    log_warn "2. 多实例目录：$INSTANCE_BASE_DIR"
+    log_warn "3. 已注册的 TeleBox PM2 进程"
+    log_warn "config.json、Telegram session、日志都会被删除。"
+
+    if ! confirm "确认全部清空并重新安装？" "N"; then
+        log_warn "已取消。"
+        return
+    fi
+
+    local name
+    while IFS= read -r name; do
+        set_instance "$name"
+        delete_pm2_instance
+    done < <(list_all_instance_names)
+
+    rm -rf "$HOME/telebox" "$INSTANCE_BASE_DIR"
+    set_instance "$DEFAULT_INSTANCE"
+    install_or_update_instance
+}
+
 menu() {
     while true; do
         list_instances
         echo
-        echo "1) 安装或更新实例"
+        echo "1) 安装/新增实例"
         echo "2) 切换 Telegram 登录账号"
-        echo "3) 启动或重载实例"
-        echo "4) 停止实例"
-        echo "5) 查看实例状态"
-        echo "6) 查看实例日志"
-        echo "7) 删除实例"
+        echo "3) 查看实例状态"
+        echo "4) 查看实例日志"
+        echo "5) 删除单个实例"
+        echo "6) 全部清空并重新安装"
         echo "0) 退出"
         echo
 
@@ -579,23 +618,18 @@ menu() {
                 ;;
             3)
                 select_instance_interactive
-                start_instance
+                show_status
                 ;;
             4)
                 select_instance_interactive
-                stop_instance
+                show_logs
                 ;;
             5)
                 select_instance_interactive
-                show_status
+                remove_instance
                 ;;
             6)
-                select_instance_interactive
-                show_logs
-                ;;
-            7)
-                select_instance_interactive
-                remove_instance
+                reset_all_and_install
                 ;;
             0)
                 exit 0
@@ -653,6 +687,9 @@ main() {
         remove|uninstall)
             set_instance "${instance:-$DEFAULT_INSTANCE}"
             remove_instance
+            ;;
+        reset|reset-all|reinstall)
+            reset_all_and_install
             ;;
         help|-h|--help)
             usage
