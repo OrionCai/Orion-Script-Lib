@@ -507,6 +507,14 @@ async function handlePrivate(msg, env, ctx) {
     if (text === "/start") {
         if (isAdm && ctx) ctx.waitUntil(registerCommands(env));
         if (!isAdm) {
+            if (u.topic_id) await syncTopicProfile(u, msg.from, env);
+            if (u.user_state === 'verified' && !u.is_blocked) {
+                return api(env.BOT_TOKEN, "sendMessage", {
+                    chat_id: id,
+                    text: "✅ 您已经完成验证，可以直接发送消息，我会帮您转达给管理员。",
+                    reply_to_message_id: msg.message_id
+                });
+            }
             await updUser(id, { user_state: 'new' }, env);
             u.user_state = 'new';
         }
@@ -563,8 +571,17 @@ async function sendStart(id, msg, env) {
     const u = await getUser(id, env);
     if (u.topic_id) {
         try {
-            const success = await sendInfoCardToTopic(env, u, msg.from, u.topic_id);
-            if (!success) await updUser(id, { topic_id: null }, env);
+            await syncTopicProfile(u, msg.from, env);
+            if (!u.user_info.card_msg_id) {
+                const cardId = await sendInfoCardToTopic(env, u, msg.from, u.topic_id);
+                if (cardId) {
+                    u.user_info.card_msg_id = cardId;
+                    u.user_info.join_date = msg.date || (Date.now()/1000);
+                    await updUser(id, { user_info: u.user_info }, env);
+                } else {
+                    await updUser(id, { topic_id: null }, env);
+                }
+            }
         } catch (e) { await updUser(id, { topic_id: null }, env); }
     }
 
@@ -687,9 +704,7 @@ async function relayToTopic(msg, u, env) {
 
     // 1. 动态检测并同步用户基础标识信息变更
     if (u.user_info.name !== uMeta.name || u.user_info.username !== uMeta.username) {
-        u.user_info.name = uMeta.name; u.user_info.username = uMeta.username;
-        await updUser(uid, { user_info: u.user_info }, env);
-        if (u.topic_id) api(env.BOT_TOKEN, "editForumTopic", { chat_id: env.ADMIN_GROUP_ID, message_thread_id: u.topic_id, name: uMeta.topicName }).catch(e=>{});
+        await syncTopicProfile(u, msg.from, env);
     }
 
     // 2. 线程池资源申请：建立独立话题
@@ -703,6 +718,7 @@ async function relayToTopic(msg, u, env) {
                 const t = await api(env.BOT_TOKEN, "createForumTopic", { chat_id: env.ADMIN_GROUP_ID, name: uMeta.topicName });
                 tid = t.message_thread_id.toString();
                 u.user_info.card_msg_id = null;
+                u.user_info.topic_name = uMeta.topicName;
                 const dummy = await api(env.BOT_TOKEN, "sendMessage", { chat_id: env.ADMIN_GROUP_ID, message_thread_id: tid, text: "✨ 正在加载用户资料...", disable_notification: true });
                 u.user_info.dummy_msg_id = dummy.message_id;
                 await updUser(uid, { topic_id: tid, user_info: u.user_info }, env);
@@ -1306,6 +1322,38 @@ const getUMeta = (tgUser, dbUser, d) => {
         card: `<b>🪪 用户身份卡片</b>\n---\n👤: ${safeName}\n🏷️: ${labelDisplay}\n🆔: <code>${id}</code>${note}\n🕒: <code>${timeStr}</code>`
     };
 };
+
+async function syncTopicProfile(u, tgUser, env) {
+    const meta = getUMeta(tgUser, u, Date.now() / 1000);
+    const nextInfo = { ...(u.user_info || {}) };
+    let dirty = false;
+
+    if (nextInfo.name !== meta.name) {
+        nextInfo.name = meta.name;
+        dirty = true;
+    }
+    if (nextInfo.username !== meta.username) {
+        nextInfo.username = meta.username;
+        dirty = true;
+    }
+
+    if (u.topic_id && meta.topicName && nextInfo.topic_name !== meta.topicName) {
+        await api(env.BOT_TOKEN, "editForumTopic", {
+            chat_id: env.ADMIN_GROUP_ID,
+            message_thread_id: u.topic_id,
+            name: meta.topicName
+        }).catch(() => {});
+        nextInfo.topic_name = meta.topicName;
+        dirty = true;
+    }
+
+    if (dirty) {
+        u.user_info = nextInfo;
+        await updUser(u.user_id, { user_info: nextInfo }, env);
+    }
+
+    return meta;
+}
 
 // 动态键盘矩阵构建：受限 API 规避检查点
 const getBtns = (id, blk, username) => {
