@@ -401,10 +401,27 @@ module.exports = {
     restart_delay: 4000,
     env: {
       NODE_ENV: "production"
+    },
+    env_production: {
+      NODE_ENV: "production"
     }
   }]
 }
 EOF
+}
+
+cleanup_legacy_pm2_entries() {
+    if ! command -v pm2 >/dev/null 2>&1; then
+        return
+    fi
+
+    local legacy_name
+    for legacy_name in ecosystem.local ecosystem.local.config; do
+        if [[ "$legacy_name" != "$PM2_NAME" ]] && pm2 describe "$legacy_name" >/dev/null 2>&1; then
+            log_warn "清理旧的误启动 PM2 进程：$legacy_name"
+            pm2 delete "$legacy_name" || true
+        fi
+    done
 }
 
 setup_pm2_startup() {
@@ -431,6 +448,7 @@ start_instance() {
     ensure_pm2
     mkdir -p "$APP_DIR/logs"
     write_pm2_wrapper
+    cleanup_legacy_pm2_entries
 
     cd "$APP_DIR"
     pm2 startOrReload ecosystem.local.config.js --env production
@@ -638,7 +656,11 @@ menu() {
         esac
 
         echo
-        read -r -p "按回车键返回菜单..." _
+        local next_action
+        read -r -p "按回车键返回菜单，输入 0 退出: " next_action
+        if [[ "$next_action" == "0" ]]; then
+            exit 0
+        fi
     done
 }
 
