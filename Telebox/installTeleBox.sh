@@ -382,7 +382,7 @@ interactive_login() {
 }
 
 write_pm2_wrapper() {
-    local wrapper_file="$APP_DIR/ecosystem.local.cjs"
+    local wrapper_file="$APP_DIR/ecosystem.local.config.js"
 
     cat > "$wrapper_file" <<EOF
 module.exports = {
@@ -433,7 +433,7 @@ start_instance() {
     write_pm2_wrapper
 
     cd "$APP_DIR"
-    pm2 startOrReload ecosystem.local.cjs --env production
+    pm2 startOrReload ecosystem.local.config.js --env production
     pm2 save
     setup_pm2_startup
 }
