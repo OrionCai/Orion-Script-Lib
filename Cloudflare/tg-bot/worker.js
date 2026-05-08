@@ -176,9 +176,8 @@ async function dbInit(env) {
     await env.TG_BOT_DB.batch([
         env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)`),
         env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS users (user_id TEXT PRIMARY KEY, user_state TEXT DEFAULT 'new', is_blocked INTEGER DEFAULT 0, block_count INTEGER DEFAULT 0, first_message_sent INTEGER DEFAULT 0, topic_id TEXT, user_info_json TEXT)`),
-        env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS messages (user_id TEXT, message_id TEXT, text TEXT, date INTEGER, PRIMARY KEY (user_id, message_id))`)
+        env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS messages (user_id TEXT, message_id TEXT, text TEXT, date INTEGER, topic_message_id TEXT, PRIMARY KEY (user_id, message_id))`)
     ]);
-    try { await sql(env, "ALTER TABLE messages ADD COLUMN topic_message_id TEXT"); } catch (e) {}
 }
 
 // --- 4. 业务逻辑 (核心流) ---
@@ -650,6 +649,31 @@ async function sendStart(id, msg, env) {
 async function handleVerifiedMsg(msg, u, env) {
     const id = u.user_id, text = msg.text || "";
 
+    // 如果用户之前被标记为屏蔽 Bot，但现在能发消息，说明已解除屏蔽
+    if (u.user_info && u.user_info.bot_blocked) {
+        u.user_info.bot_blocked = false;
+        delete u.user_info.bot_blocked_ts;
+        await updUser(id, { user_info: u.user_info }, env);
+        console.log(`Cleared bot_blocked mark for user ${id} after receiving message`);
+
+        // 更新用户卡片显示
+        try {
+            if (u.topic_id && u.user_info.card_msg_id) {
+                const mockTgUser = { id: id, username: u.user_info.username || "", first_name: u.user_info.name || "(未获取)", last_name: "" };
+                const newMeta = getUMeta(mockTgUser, u, u.user_info.join_date || (Date.now()/1000));
+                await api(env.BOT_TOKEN, "editMessageCaption", {
+                    chat_id: env.ADMIN_GROUP_ID,
+                    message_id: u.user_info.card_msg_id,
+                    caption: newMeta.card,
+                    parse_mode: "HTML",
+                    reply_markup: getBtns(id, u.is_blocked, newMeta.username)
+                });
+            }
+        } catch (e) {
+            console.log("Failed to update card after bot_blocked cleared:", e.message);
+        }
+    }
+
     // 敏感词屏蔽预检系统
     if (text) {
         const kws = await getJsonCfg('block_keywords', env);
@@ -732,6 +756,9 @@ async function relayToTopic(msg, u, env) {
     }
 
     try {
+        // 资料卡片必须先落到话题里，后续用户消息才不会把卡片顶到下面。
+        await ensureInfoCardBeforeRelay(env, u, msg.from, tid, msg.date);
+
         let forwardedMsg;
         const rawText = msg.text || "";
         let topicReplyToMsgId = undefined;
@@ -784,37 +811,6 @@ async function relayToTopic(msg, u, env) {
             }
         }
 
-        // 推送资料卡片流程补偿机制
-        try {
-            let infoDirty = false;
-            if (!u.user_info.card_msg_id) {
-                try {
-                    const cardId = await sendInfoCardToTopic(env, u, msg.from, tid, msg.date);
-                    if (cardId) {
-                        u.user_info.card_msg_id = cardId;
-                        u.user_info.join_date = msg.date || (Date.now()/1000);
-                        infoDirty = true;
-                    }
-                } catch (innerErr) {
-                    if (innerErr.message && (innerErr.message.includes("thread") || innerErr.message.includes("not found"))) {
-                        throw innerErr;
-                    }
-                }
-            }
-            // 回收临时占位符提升界面整洁度
-            if (u.user_info.dummy_msg_id) {
-                await api(env.BOT_TOKEN, "deleteMessage", { chat_id: env.ADMIN_GROUP_ID, message_id: u.user_info.dummy_msg_id }).catch(() => {});
-                delete u.user_info.dummy_msg_id; infoDirty = true;
-            }
-            if (infoDirty) await updUser(uid, { user_info: u.user_info }, env);
-        } catch (processErr) {
-            if (processErr.message && (processErr.message.includes("thread") || processErr.message.includes("not found"))) {
-                await updUser(uid, { topic_id: null }, env);
-                u.topic_id = null;
-                return relayToTopic(msg, u, env); // 进行一次自愈递归重试
-            }
-        }
-
         // ---------------------------------------------------------------------
         // * 修改点：注释/移除了面向用户的 “✅ 已送达” 反馈回执 API 调用。
         // 此动作去除了多余的底层 fetch() 开销。
@@ -839,6 +835,29 @@ async function relayToTopic(msg, u, env) {
             await api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "❌ 发送失败，系统异常" });
         }
     }
+}
+
+async function ensureInfoCardBeforeRelay(env, u, tgUser, tid, date) {
+    let infoDirty = false;
+    if (!u.user_info) u.user_info = {};
+
+    if (!u.user_info.card_msg_id) {
+        const cardId = await sendInfoCardToTopic(env, u, tgUser, tid, date);
+        if (cardId) {
+            u.user_info.card_msg_id = cardId;
+            u.user_info.join_date = date || (Date.now()/1000);
+            infoDirty = true;
+        }
+    }
+
+    // 回收临时占位符提升界面整洁度；先发卡片再删占位，确保新 topic 里卡片始终早于用户消息。
+    if (u.user_info.dummy_msg_id) {
+        await api(env.BOT_TOKEN, "deleteMessage", { chat_id: env.ADMIN_GROUP_ID, message_id: u.user_info.dummy_msg_id }).catch(() => {});
+        delete u.user_info.dummy_msg_id;
+        infoDirty = true;
+    }
+
+    if (infoDirty) await updUser(u.user_id, { user_info: u.user_info }, env);
 }
 
 // --- 核心：发送用户信息复合卡片 ---
@@ -931,6 +950,125 @@ async function handleBackup(msg, meta, env) {
 }
 
 // --- 6. 管理员功能模块 (双向交互枢纽) ---
+const withReplyTarget = (replyToMsgId) => {
+    const id = parseInt(replyToMsgId);
+    return Number.isFinite(id) ? { reply_to_message_id: id } : {};
+};
+
+const isReplyTargetError = (e) => {
+    const msg = (e?.message || "").toLowerCase();
+    const mentionsReply = msg.includes("reply") || msg.includes("replied");
+    return mentionsReply && (msg.includes("not found") || msg.includes("invalid"));
+};
+
+const isEntityPayloadError = (e) => {
+    const msg = (e?.message || "").toLowerCase();
+    return msg.includes("entity") || msg.includes("entities") || msg.includes("parse");
+};
+
+const withoutReplyTarget = (body) => {
+    const next = { ...body };
+    delete next.reply_to_message_id;
+    return next;
+};
+
+const withoutEntityPayload = (body) => {
+    const next = { ...body };
+    delete next.entities;
+    delete next.caption_entities;
+    return next;
+};
+
+async function apiWithDeliveryFallback(env, method, body) {
+    try {
+        return await api(env.BOT_TOKEN, method, body);
+    } catch (firstErr) {
+        const candidates = [];
+        const hasReplyTarget = body.reply_to_message_id !== undefined;
+        const hasEntityPayload = body.entities || body.caption_entities;
+
+        if (hasReplyTarget && isReplyTargetError(firstErr)) {
+            candidates.push({ body: withoutReplyTarget(body), reason: "reply target missing" });
+            if (hasEntityPayload) candidates.push({ body: withoutEntityPayload(withoutReplyTarget(body)), reason: "reply target missing + entity fallback" });
+        }
+        if (hasEntityPayload && isEntityPayloadError(firstErr)) {
+            candidates.push({ body: withoutEntityPayload(body), reason: "entity fallback" });
+            if (hasReplyTarget) candidates.push({ body: withoutReplyTarget(withoutEntityPayload(body)), reason: "entity fallback + reply target removed" });
+        }
+
+        let lastErr = firstErr;
+        for (const candidate of candidates) {
+            try {
+                console.warn(`Delivery fallback [${method}]: ${candidate.reason}`);
+                return await api(env.BOT_TOKEN, method, candidate.body);
+            } catch (candidateErr) {
+                lastErr = candidateErr;
+            }
+        }
+        throw lastErr;
+    }
+}
+
+async function deliverAdminMessageToUser(msg, uid, replyToMsgId, env) {
+    const reply = withReplyTarget(replyToMsgId);
+    const base = { chat_id: uid, ...reply };
+
+    if (msg.text) {
+        const body = { ...base, text: msg.text };
+        if (msg.entities) body.entities = msg.entities;
+        return apiWithDeliveryFallback(env, "sendMessage", body);
+    }
+
+    if (msg.photo) {
+        const body = { ...base, photo: msg.photo[msg.photo.length - 1].file_id };
+        if (msg.caption) body.caption = msg.caption;
+        if (msg.caption_entities) body.caption_entities = msg.caption_entities;
+        return apiWithDeliveryFallback(env, "sendPhoto", body);
+    }
+
+    const mediaMap = [
+        ["animation", "sendAnimation", "animation"],
+        ["video", "sendVideo", "video"],
+        ["document", "sendDocument", "document"],
+        ["audio", "sendAudio", "audio"],
+        ["voice", "sendVoice", "voice"],
+        ["video_note", "sendVideoNote", "video_note"],
+        ["sticker", "sendSticker", "sticker"]
+    ];
+
+    for (const [field, method, param] of mediaMap) {
+        if (!msg[field]) continue;
+        const body = { ...base, [param]: msg[field].file_id };
+        if (msg.caption) body.caption = msg.caption;
+        if (msg.caption_entities) body.caption_entities = msg.caption_entities;
+        return apiWithDeliveryFallback(env, method, body);
+    }
+
+    if (msg.location) {
+        return apiWithDeliveryFallback(env, "sendLocation", {
+            ...base,
+            latitude: msg.location.latitude,
+            longitude: msg.location.longitude
+        });
+    }
+
+    if (msg.contact) {
+        return apiWithDeliveryFallback(env, "sendContact", {
+            ...base,
+            phone_number: msg.contact.phone_number,
+            first_name: msg.contact.first_name,
+            last_name: msg.contact.last_name || ""
+        });
+    }
+
+    return apiWithDeliveryFallback(env, "copyMessage", {
+        chat_id: uid,
+        from_chat_id: msg.chat.id,
+        message_id: msg.message_id,
+        ...reply
+    });
+}
+
 async function handleAdminReply(msg, env) {
     if (!msg.message_thread_id || msg.from.is_bot || !(await isAuthAdmin(msg.from.id, env))) return;
 
@@ -958,24 +1096,113 @@ async function handleAdminReply(msg, env) {
         }
     }
 
-    const uid = (await sql(env, "SELECT user_id FROM users WHERE topic_id = ?", msg.message_thread_id.toString(), 'first'))?.user_id;
-    if (!uid) return;
+    const topicIdStr = msg.message_thread_id.toString();
+    console.log(`Admin reply debug: topic_id=${topicIdStr}, admin_msg_id=${msg.message_id}`);
+
+    const userRef = await sql(env, "SELECT user_id FROM users WHERE topic_id = ?", topicIdStr, 'first');
+    console.log(`Admin reply debug: userRef=`, userRef);
+
+    const uid = userRef?.user_id;
+    if (!uid) {
+        console.error(`Admin reply failed: No user found for topic_id=${topicIdStr}`);
+        return api(env.BOT_TOKEN, "sendMessage", {
+            chat_id: msg.chat.id,
+            message_thread_id: msg.message_thread_id,
+            text: `❌ 系统错误：未找到关联的用户（topic_id=${topicIdStr}）`
+        });
+    }
+
+    // 检查用户状态
+    const u = await getUser(uid, env);
+    console.log(`Admin reply debug: user_state=${u.user_state}, is_blocked=${u.is_blocked}`);
+
+    if (u.is_blocked) {
+        return api(env.BOT_TOKEN, "sendMessage", {
+            chat_id: msg.chat.id,
+            message_thread_id: msg.message_thread_id,
+            text: `❌ 该用户已被屏蔽，无法发送消息`
+        });
+    }
 
     let replyToMsgId = undefined;
     if (msg.reply_to_message) {
         const ref = await sql(env, "SELECT message_id FROM messages WHERE topic_message_id = ?", msg.reply_to_message.message_id.toString(), 'first');
-        if (ref) replyToMsgId = ref.message_id;
+        if (ref) {
+            replyToMsgId = ref.message_id;
+            console.log(`Admin reply debug: Found reply mapping topic_msg=${msg.reply_to_message.message_id} -> user_msg=${replyToMsgId}`);
+        } else {
+            console.log(`Admin reply debug: No reply mapping found for topic_msg=${msg.reply_to_message.message_id}`);
+        }
     }
 
     try {
-        const sent = await api(env.BOT_TOKEN, "copyMessage", { chat_id: uid, from_chat_id: msg.chat.id, message_id: msg.message_id, reply_to_message_id: replyToMsgId });
+        console.log(`Admin reply debug: Delivering message to uid=${uid}, replyToMsgId=${replyToMsgId}`);
+        const sent = await deliverAdminMessageToUser(msg, uid, replyToMsgId, env);
+        console.log(`Admin reply debug: Delivery success, sent.message_id=${sent?.message_id}`);
         if (sent && sent.message_id) {
             const storeText = msg.text || msg.caption || "[Admin Message]";
             await sql(env, "INSERT OR REPLACE INTO messages (user_id, message_id, text, date, topic_message_id) VALUES (?,?,?,?,?)",
                 [uid, sent.message_id.toString(), storeText, msg.date || Math.floor(Date.now() / 1000), msg.message_id.toString()]);
         }
         // 此处为管理员端给用户下发消息的主逻辑。根据之前的版本，管理员侧发送成功后的回执代码也已经去除
-    } catch (e) { await api(env.BOT_TOKEN, "sendMessage", { chat_id: msg.chat.id, message_thread_id: msg.message_thread_id, text: "❌ 内部投递失败" }); }
+    } catch (e) {
+        console.error("Admin Delivery Failed:", e);
+        console.error("Admin Delivery Failed - Error details:", {
+            message: e.message,
+            stack: e.stack,
+            uid: uid,
+            topicId: topicIdStr,
+            replyToMsgId: replyToMsgId
+        });
+
+        // 检测用户是否屏蔽了 Bot
+        const isBlocked = e.message && e.message.includes("bot was blocked by the user");
+
+        if (isBlocked) {
+            // 自动标记用户为屏蔽状态
+            try {
+                const u = await getUser(uid, env);
+                if (!u.user_info.bot_blocked) {
+                    u.user_info.bot_blocked = true;
+                    u.user_info.bot_blocked_ts = Date.now();
+                    await updUser(uid, { user_info: u.user_info }, env);
+                    console.log(`Auto-marked user ${uid} as bot_blocked`);
+
+                    // 更新用户卡片显示
+                    if (u.topic_id && u.user_info.card_msg_id) {
+                        const mockTgUser = { id: uid, username: u.user_info.username || "", first_name: u.user_info.name || "(未获取)", last_name: "" };
+                        const newMeta = getUMeta(mockTgUser, u, u.user_info.join_date || (Date.now()/1000));
+                        try {
+                            await api(env.BOT_TOKEN, "editMessageCaption", {
+                                chat_id: env.ADMIN_GROUP_ID,
+                                message_id: u.user_info.card_msg_id,
+                                caption: newMeta.card,
+                                parse_mode: "HTML",
+                                reply_markup: getBtns(uid, u.is_blocked, newMeta.username)
+                            });
+                        } catch (editErr) {
+                            console.log("Failed to update card after bot_blocked detection:", editErr.message);
+                        }
+                    }
+                }
+            } catch (markErr) {
+                console.error("Failed to mark user as bot_blocked:", markErr);
+            }
+
+            await api(env.BOT_TOKEN, "sendMessage", {
+                chat_id: msg.chat.id,
+                message_thread_id: msg.message_thread_id,
+                text: `⚠️ <b>用户已屏蔽 Bot</b>\n\n该用户已在 Telegram 中屏蔽了本机器人，无法接收消息。\n\n请通过其他方式联系用户，让其：\n1️⃣ 打开与机器人的聊天\n2️⃣ 解除屏蔽\n3️⃣ 重新发送 /start`,
+                parse_mode: "HTML"
+            });
+        } else {
+            await api(env.BOT_TOKEN, "sendMessage", {
+                chat_id: msg.chat.id,
+                message_thread_id: msg.message_thread_id,
+                text: `❌ 内部投递失败：${e.message || "Unknown error"}\n\n调试信息：\n用户ID: ${uid}\n话题ID: ${topicIdStr}`
+            });
+        }
+    }
 }
 
 async function handleEdit(msg, env) {
@@ -1102,6 +1329,15 @@ async function handleCallback(cb, env) {
         else if (['block','unblock'].includes(act)) {
             const isB = act === 'block'; const uid = p1; const u = await getUser(uid, env); const bid = await getCfg('blocked_topic_id', env);
             await updUser(uid, { is_blocked: isB, block_count: 0 }, env);
+
+            // 如果是解封操作，清除 bot_blocked 标记
+            if (!isB && u.user_info.bot_blocked) {
+                u.user_info.bot_blocked = false;
+                delete u.user_info.bot_blocked_ts;
+                await updUser(uid, { user_info: u.user_info }, env);
+                console.log(`Cleared bot_blocked mark for user ${uid} after admin unblock`);
+            }
+
             // 响应变更，刷新目标人员资料卡片上的按钮渲染状态
             if (u.user_info.card_msg_id) {
                 api(env.BOT_TOKEN, "editMessageReplyMarkup", { chat_id: env.ADMIN_GROUP_ID, message_id: u.user_info.card_msg_id, reply_markup: getBtns(uid, isB, u.user_info.username) }).catch(()=>{});
@@ -1314,12 +1550,22 @@ const getUMeta = (tgUser, dbUser, d) => {
     const labelDisplay = tgUser.username ? `@${tgUser.username}` : "未设公开ID";
     const timeStr = new Date(d*1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
 
+    // 检测并显示屏蔽状态
+    let blockStatus = "";
+    if (dbUser.is_blocked) {
+        blockStatus = `\n🚫 <b>管理员屏蔽:</b> 是`;
+    }
+    if (dbUser.user_info && dbUser.user_info.bot_blocked) {
+        const blockTime = new Date(dbUser.user_info.bot_blocked_ts || d*1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+        blockStatus += `\n⛔ <b>用户屏蔽Bot:</b> 是 (${blockTime})`;
+    }
+
     return {
         userId: id,
         name,
         username: tgUser.username,
         topicName: name.substring(0, 128),
-        card: `<b>🪪 用户身份卡片</b>\n---\n👤: ${safeName}\n🏷️: ${labelDisplay}\n🆔: <code>${id}</code>${note}\n🕒: <code>${timeStr}</code>`
+        card: `<b>🪪 用户身份卡片</b>\n---\n👤: ${safeName}\n🏷️: ${labelDisplay}\n🆔: <code>${id}</code>${note}${blockStatus}\n🕒: <code>${timeStr}</code>`
     };
 };
 

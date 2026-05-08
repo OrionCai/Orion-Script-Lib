@@ -40,6 +40,7 @@ Temporary Items
 .idea/misc.xml
 .idea/uiDesigner.xml
 .idea/jsLibraryMappings.xml
+.idea/claudeCodeTabState.xml
 # 拦截旧版 IDEA 和 Eclipse 文件
 *.iml
 *.iws
