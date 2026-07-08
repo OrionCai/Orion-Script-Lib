@@ -314,6 +314,28 @@ install_node_deps() {
     fi
 }
 
+refresh_node_deps() {
+    log_step "重新拉取项目依赖：$INSTANCE_NAME"
+    if [[ ! -d "$APP_DIR" ]]; then
+        log_err "实例目录不存在：$APP_DIR"
+        exit 1
+    fi
+
+    install_system_deps
+    ensure_app_repo
+
+    cd "$APP_DIR"
+    log_warn "即将停止实例并重新安装 node_modules。"
+    stop_instance
+
+    log_info "清理旧依赖目录和 npm 缓存..."
+    rm -rf node_modules
+    npm cache verify
+
+    install_node_deps
+    start_instance
+}
+
 config_has_session() {
     local config_file="$APP_DIR/config.json"
     [[ -f "$config_file" ]] || return 1
@@ -554,6 +576,7 @@ usage() {
   $0 start [instance]        启动或重载实例
   $0 stop [instance]         停止实例
   $0 restart [instance]      重启实例
+  $0 deps [instance]         重新拉取项目依赖并重启实例
   $0 status [instance]       查看实例状态
   $0 logs [instance]         查看实例日志
   $0 remove [instance]       删除实例目录和 PM2 进程
@@ -617,6 +640,7 @@ menu() {
         echo "4) 查看实例日志"
         echo "5) 删除单个实例"
         echo "6) 全部清空并重新安装"
+        echo "7) 重新拉取项目依赖"
         echo "0) 退出"
         echo
 
@@ -646,6 +670,10 @@ menu() {
                 ;;
             6)
                 reset_all_and_install
+                ;;
+            7)
+                select_instance_interactive
+                refresh_node_deps
                 ;;
             0)
                 exit 0
@@ -695,6 +723,10 @@ main() {
             set_instance "${instance:-$DEFAULT_INSTANCE}"
             stop_instance
             start_instance
+            ;;
+        deps|refresh-deps|reinstall-deps)
+            set_instance "${instance:-$DEFAULT_INSTANCE}"
+            refresh_node_deps
             ;;
         status)
             set_instance "${instance:-$DEFAULT_INSTANCE}"
