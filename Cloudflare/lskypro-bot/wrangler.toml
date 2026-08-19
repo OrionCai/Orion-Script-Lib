@@ -1,0 +1,18 @@
+# Cloudflare Worker 名称
+name = "lskypro-telegram-worker"
+
+# Worker 入口文件
+main = "lskypro-telegram-worker.js"
+
+# Cloudflare Workers 兼容日期
+compatibility_date = "2026-08-19"
+
+# 如果后续需要 Node.js 兼容能力，可以打开
+# compatibility_flags = ["nodejs_compat"]
+
+# D1 数据库绑定
+# 注意：database_id 必须替换成你自己的 D1 数据库 ID
+[[d1_databases]]
+binding = "DB"
+database_name = "lsky-telegram-worker"
+database_id = "e5a1c753-525a-4876-8f74-da075554791c"
