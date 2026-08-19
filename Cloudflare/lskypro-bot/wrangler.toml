@@ -20,14 +20,23 @@ database_id = "e5a1c753-525a-4876-8f74-da075554791c"
 [observability]
 enabled = false
 head_sampling_rate = 1
-
 [observability.logs]
 enabled = true
 head_sampling_rate = 1
 persist = true
 invocation_logs = true
-
 [observability.traces]
 enabled = false
 persist = true
 head_sampling_rate = 1
+
+[vars]
+ALLOWED_TELEGRAM_USER_IDS = "1050736994"
+LSKY_API_URL = "https://img.orionc.me/api/v1/upload"
+LSKY_PERMISSION = "1"
+SHLINK_API_URL = "https://go.orionc.me"
+SHORTEN_ALLOWED_HOSTS = "img.orionc.me"
+MAX_FILE_MB = "25"
+MAX_UPLOAD_QUEUE_IMAGES = "100"
+ALBUM_WAIT_SECONDS = "5"
+REQUEST_TIMEOUT_SECONDS = "60"
