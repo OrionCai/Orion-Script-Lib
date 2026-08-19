@@ -1,5 +1,5 @@
-# Cloudflare Worker 名称
-name = "lskypro-telegram-worker"
+# Cloudflare/lskypro-bot/wrangler.toml
+name = 'lsky-telegram-worker'
 
 # Worker 入口文件
 main = "lskypro-telegram-worker.js"
