@@ -16,3 +16,18 @@ compatibility_date = "2026-08-19"
 binding = "DB"
 database_name = "lsky-telegram-worker"
 database_id = "e5a1c753-525a-4876-8f74-da075554791c"
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
