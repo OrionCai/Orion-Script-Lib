@@ -38,17 +38,22 @@ const DEFAULTS = {
 
 // 消息类型检查与映射字典
 const MSG_TYPES = [
-    { check: m => m.forward_from || m.forward_from_chat, key: 'enable_forward_forwarding', name: "转发消息", extra: m => m.forward_from_chat?.type === 'channel' ? 'enable_channel_forwarding' : null },
+    { check: m => m.forward_from || m.forward_from_chat || m.forward_origin, key: 'enable_forward_forwarding', name: "转发消息", extra: m => (m.forward_from_chat?.type === 'channel' || m.forward_origin?.type === 'channel') ? 'enable_channel_forwarding' : null },
     { check: m => m.audio || m.voice, key: 'enable_audio_forwarding', name: "语音/音频" },
     { check: m => m.sticker || m.animation, key: 'enable_sticker_forwarding', name: "贴纸/GIF" },
     { check: m => m.photo || m.video || m.document, key: 'enable_image_forwarding', name: "媒体文件" },
-    { check: m => (m.entities||[]).some(e => ['url','text_link'].includes(e.type)), key: 'enable_link_forwarding', name: "链接" },
-    { check: m => m.text, key: 'enable_text_forwarding', name: "纯文本" }
+    { check: m => ([...(m.entities||[]), ...(m.caption_entities||[])]).some(e => ['url','text_link'].includes(e.type)), key: 'enable_link_forwarding', name: "链接" },
+    { check: m => m.text || m.caption, key: 'enable_text_forwarding', name: "纯文本" }
 ];
 
 const REGEX_MAX_PATTERN_LEN = 256;
 const REGEX_MAX_TEXT_LEN = 512;
 const MAX_BATCH_DELETE = 100;
+const API_TIMEOUT_MS = 15000;
+const API_MAX_RETRIES = 2;
+const TOPIC_LOCK_TIMEOUT_MS = 30000;
+const DATABASE_RETENTION_SECONDS = 90 * 24 * 60 * 60;
+const RULE_PAGE_SIZE = 20;
 const REGEX_REJECT_PATTERNS = [
     /\([^)]*\)\s*[+*{]/,
     /\(\s*\.\*\s*\)\s*\+/,
@@ -58,14 +63,15 @@ const REGEX_REJECT_PATTERNS = [
     /\(\?<![\s\S]*\)/
 ];
 
+let migrationPromise = null;
+
 // --- 2. 核心入口 (Entry Point) ---
 export default {
     async fetch(req, env, ctx) {
-        // 确保数据库初始化完毕，waitUntil不会阻塞主线程的即时响应
-        ctx.waitUntil(dbInit(env).catch(err => console.error("DB Init Failed:", err)));
-        const url = new URL(req.url);
-
         try {
+            await dbInit(env);
+            const url = new URL(req.url);
+
             // GET 请求处理：验证页面加载或连通性测试
             if (req.method === "GET") {
                 if (url.pathname === "/verify") return handleVerifyPage(url, env);
@@ -77,7 +83,8 @@ export default {
                 if (!isTelegramWebhook(req, env)) return new Response("Forbidden", { status: 403 });
                 try {
                     const update = await req.json();
-                    ctx.waitUntil(handleUpdate(update, env, ctx));
+                    ctx.waitUntil(handleUpdate(update, env, ctx).catch(err => console.error("Update Failed:", err?.stack || err)));
+                    if (Math.random() < 0.01) ctx.waitUntil(cleanupDatabase(env));
                     return new Response("OK");
                 } catch (jsonErr) {
                     console.error("Invalid JSON Update:", jsonErr);
@@ -148,11 +155,13 @@ async function getUser(id, env) {
         try { await sql(env, "INSERT OR IGNORE INTO users (user_id, user_state) VALUES (?, 'new')", id); } catch {}
         u = await sql(env, "SELECT * FROM users WHERE user_id = ?", id, 'first');
     }
-    if (!u) u = { user_id: id, user_state: 'new', is_blocked: 0, block_count: 0, first_message_sent: 0, topic_id: null, user_info_json: "{}" };
+    if (!u) u = { user_id: id, user_state: 'new', is_blocked: 0, is_muted: 0, block_count: 0, first_message_sent: 0, topic_id: null, topic_creating: 0, topic_lock_at: null, user_info_json: "{}" };
 
     // 布尔状态类型转换及附属 JSON 解析
     u.is_blocked = !!u.is_blocked;
+    u.is_muted = !!u.is_muted;
     u.first_message_sent = !!u.first_message_sent;
+    u.topic_creating = !!u.topic_creating;
     u.user_info = safeParse(u.user_info_json);
     return u;
 }
@@ -173,25 +182,102 @@ async function updUser(id, data, env) {
 // 数据库表结构初始化与防御性兼容处理
 async function dbInit(env) {
     if (!env.TG_BOT_DB) return;
+    if (migrationPromise) return migrationPromise;
+    migrationPromise = migrateDb(env).catch((error) => {
+        migrationPromise = null;
+        throw error;
+    });
+    return migrationPromise;
+}
+
+async function migrateDb(env) {
     await env.TG_BOT_DB.batch([
         env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)`),
-        env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS users (user_id TEXT PRIMARY KEY, user_state TEXT DEFAULT 'new', is_blocked INTEGER DEFAULT 0, block_count INTEGER DEFAULT 0, first_message_sent INTEGER DEFAULT 0, topic_id TEXT, user_info_json TEXT)`),
-        env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS messages (user_id TEXT, message_id TEXT, text TEXT, date INTEGER, topic_message_id TEXT, PRIMARY KEY (user_id, message_id))`)
+        env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS users (user_id TEXT PRIMARY KEY, user_state TEXT DEFAULT 'new', is_blocked INTEGER DEFAULT 0, is_muted INTEGER DEFAULT 0, block_count INTEGER DEFAULT 0, first_message_sent INTEGER DEFAULT 0, topic_id TEXT, topic_creating INTEGER DEFAULT 0, topic_lock_at INTEGER, user_info_json TEXT, updated_at INTEGER)`),
+        env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS messages (user_id TEXT, message_id TEXT, text TEXT, date INTEGER, topic_message_id TEXT, PRIMARY KEY (user_id, message_id))`),
+        env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS processed_updates (update_id TEXT PRIMARY KEY, processed_at INTEGER NOT NULL)`),
+        env.TG_BOT_DB.prepare(`CREATE INDEX IF NOT EXISTS idx_users_topic_id ON users(topic_id)`),
+        env.TG_BOT_DB.prepare(`CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date)`),
+        env.TG_BOT_DB.prepare(`CREATE INDEX IF NOT EXISTS idx_processed_updates_time ON processed_updates(processed_at)`)
     ]);
+    await ensureUserColumn(env, "is_muted", "INTEGER DEFAULT 0");
+    await ensureUserColumn(env, "topic_creating", "INTEGER DEFAULT 0");
+    await ensureUserColumn(env, "topic_lock_at", "INTEGER");
+    await ensureUserColumn(env, "updated_at", "INTEGER");
+}
+
+async function ensureUserColumn(env, columnName, definition) {
+    try {
+        await env.TG_BOT_DB.prepare(`ALTER TABLE users ADD COLUMN ${columnName} ${definition}`).run();
+    } catch (error) {
+        const message = String(error?.message || error).toLowerCase();
+        if (!message.includes("duplicate column") && !message.includes("already exists")) throw error;
+    }
+}
+
+async function claimUpdate(updateId, env) {
+    if (updateId === undefined || updateId === null || !env.TG_BOT_DB) return true;
+    const result = await env.TG_BOT_DB.prepare(`
+        INSERT OR IGNORE INTO processed_updates (update_id, processed_at) VALUES (?, ?)
+    `).bind(String(updateId), Math.floor(Date.now() / 1000)).run();
+    return Number(result.meta?.changes || 0) === 1;
+}
+
+async function cleanupDatabase(env) {
+    if (!env.TG_BOT_DB) return;
+    const cutoff = Math.floor(Date.now() / 1000) - DATABASE_RETENTION_SECONDS;
+    try {
+        await env.TG_BOT_DB.batch([
+            env.TG_BOT_DB.prepare("DELETE FROM messages WHERE date < ?").bind(cutoff),
+            env.TG_BOT_DB.prepare("DELETE FROM processed_updates WHERE processed_at < ?").bind(cutoff)
+        ]);
+    } catch (error) {
+        console.error("DB cleanup failed:", error);
+    }
 }
 
 // --- 4. 业务逻辑 (核心流) ---
 
 // Telegram Bot API 原生请求封装
-async function api(token, method, body) {
+async function api(token, method, body, attempt = 0) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
     try {
         const r = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-            method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+            signal: controller.signal
         });
-        const d = await r.json();
-        if (!d.ok) { console.warn(`TG API Error [${method}]:`, d.description); throw new Error(d.description); }
+        let d;
+        try {
+            d = await r.json();
+        } catch {
+            throw new Error(`Telegram API 返回非 JSON (${method}, ${r.status})`);
+        }
+        if (!d.ok) {
+            const retryAfter = Number(d.parameters?.retry_after || 0);
+            if (d.error_code === 429 && retryAfter > 0 && attempt < API_MAX_RETRIES) {
+                await sleep(Math.min(retryAfter * 1000, 10000));
+                return api(token, method, body, attempt + 1);
+            }
+            if (r.status >= 500 && attempt < API_MAX_RETRIES) {
+                await sleep(500 * (attempt + 1));
+                return api(token, method, body, attempt + 1);
+            }
+            console.warn(`TG API Error [${method}]:`, d.description);
+            throw new Error(d.description || `Telegram API failed (${method})`);
+        }
         return d.result;
-    } catch (e) { throw e; }
+    } catch (e) {
+        if (attempt < API_MAX_RETRIES && (e?.name === "AbortError" || e instanceof TypeError)) {
+            await sleep(500 * (attempt + 1));
+            return api(token, method, body, attempt + 1);
+        }
+        throw e?.name === "AbortError" ? new Error(`Telegram API 请求超时 (${method})`) : e;
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 // 自动向 Telegram 注册快捷菜单命令
@@ -201,12 +287,24 @@ async function registerCommands(env) {
         await api(env.BOT_TOKEN, "setMyCommands", { commands: [{ command: "start", description: "开始 / Start" }], scope: { type: "default" } });
         const sets = await getAdminSets(env);
         const admins = [...sets.auth];
-        for (const id of admins) await api(env.BOT_TOKEN, "setMyCommands", { commands: [{ command: "start", description: "⚙️ 管理面板" }, { command: "help", description: "📄 帮助说明" }], scope: { type: "chat", chat_id: id } });
+        for (const id of admins) await api(env.BOT_TOKEN, "setMyCommands", { commands: [
+            { command: "start", description: "⚙️ 管理面板" },
+            { command: "help", description: "📄 帮助说明" },
+            { command: "ban", description: "封禁当前话题用户" },
+            { command: "unban", description: "解除当前话题用户封禁" },
+            { command: "card", description: "刷新当前用户资料卡" },
+            { command: "terminate", description: "删除当前用户话题" }
+        ], scope: { type: "chat", chat_id: id } });
     } catch (e) { console.error("Register Commands Failed:", e); }
 }
 
 // 全局更新对象分发调度中心
 async function handleUpdate(update, env, ctx) {
+    if (!(await claimUpdate(update?.update_id, env))) {
+        console.log("Duplicate update ignored:", update?.update_id);
+        return;
+    }
+
     const msg = update.message || update.edited_message;
     if (!msg) return update.callback_query ? handleCallback(update.callback_query, env) : null;
 
@@ -222,8 +320,11 @@ async function handleUpdate(update, env, ctx) {
     if (msg.chat.type === "private") await handlePrivate(msg, env, ctx);
     else if (msg.chat.id.toString() === env.ADMIN_GROUP_ID) {
         const delCmd = parseDelCommand(msg.text || msg.caption || "");
+        const adminCmd = parseAdminCommand(msg.text || msg.caption || "");
         if (delCmd) {
             await handleAdminDelete(msg, env, delCmd);
+        } else if (adminCmd) {
+            await handleAdminCommand(msg, env, adminCmd);
         } else {
             await handleAdminReply(msg, env);
         }
@@ -476,6 +577,50 @@ async function handleAdminBatchDelete(msg, env, options = {}) {
     }
 }
 
+async function handleAdminCommand(msg, env, cmd) {
+    if (!msg.message_thread_id || !(await isAuthAdmin(msg.from.id, env))) return;
+
+    const targetUid = cmd.arg || (await sql(env, "SELECT user_id FROM users WHERE topic_id = ?", msg.message_thread_id.toString(), 'first'))?.user_id;
+    if (!targetUid) {
+        return api(env.BOT_TOKEN, "sendMessage", {
+            chat_id: msg.chat.id,
+            message_thread_id: msg.message_thread_id,
+            text: "❌ 当前话题未绑定用户，也没有指定用户 ID"
+        });
+    }
+
+    const u = await getUser(targetUid, env);
+    if (cmd.command === "ban" || cmd.command === "unban") {
+        const isBlocked = cmd.command === "ban";
+        await setUserBlocked(env, targetUid, isBlocked);
+        const fresh = await getUser(targetUid, env);
+        await manageBlacklist(env, fresh, { id: targetUid, username: fresh.user_info.username, first_name: fresh.user_info.name }, isBlocked);
+        return api(env.BOT_TOKEN, "sendMessage", {
+            chat_id: msg.chat.id,
+            message_thread_id: msg.message_thread_id,
+            text: isBlocked ? "❌ 已封禁" : "✅ 已解封"
+        });
+    }
+
+    if (cmd.command === "card") {
+        const cardId = await rebuildInfoCard(env, targetUid, msg.message_thread_id.toString());
+        return api(env.BOT_TOKEN, "sendMessage", {
+            chat_id: msg.chat.id,
+            message_thread_id: msg.message_thread_id,
+            text: cardId ? "✅ 资料卡已刷新" : "❌ 资料卡刷新失败"
+        });
+    }
+
+    if (cmd.command === "terminate") {
+        await api(env.BOT_TOKEN, "deleteForumTopic", {
+            chat_id: env.ADMIN_GROUP_ID,
+            message_thread_id: msg.message_thread_id
+        }).catch(() => {});
+        await updUser(targetUid, { topic_id: null, topic_creating: false, topic_lock_at: null, user_info: { ...u.user_info, card_msg_id: null, dummy_msg_id: null } }, env);
+        await sql(env, "DELETE FROM messages WHERE user_id=?", [targetUid]);
+    }
+}
+
 // 私聊消息处理总线 (用户侧逻辑入口)
 async function handlePrivate(msg, env, ctx) {
     const id = msg.chat.id.toString();
@@ -519,7 +664,7 @@ async function handlePrivate(msg, env, ctx) {
         }
         return isAdm ? handleAdminConfig(id, null, 'menu', null, null, env) : sendStart(id, msg, env);
     }
-    if (text === "/help" && isAdm) return api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "ℹ️ <b>帮助</b>\n• 回复消息即对话\n• /start 打开面板\n• /del 删除单条消息\n• /del N 删除最近 N 条消息\n• /del all 清空当前话题消息（保留用户信息卡片）", parse_mode: "HTML" });
+    if (text === "/help" && isAdm) return api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "ℹ️ <b>帮助</b>\n• 回复消息即对话\n• /start 打开面板\n• /del 删除单条消息\n• /del N 删除最近 N 条消息\n• /del all 清空当前话题消息（保留用户信息卡片）\n• 管理群话题内支持 /ban /unban /card /terminate", parse_mode: "HTML" });
     if (text === "/del" && !isAdm) return handleUserDelete(msg, u, env);
     if (!isAdm && parseDelCommand(text)) {
         return api(env.BOT_TOKEN, "sendMessage", {
@@ -531,6 +676,10 @@ async function handlePrivate(msg, env, ctx) {
 
     // 2. 封禁拦截层
     if (u.is_blocked) {
+        return;
+    }
+
+    if (u.is_muted) {
         return;
     }
 
@@ -647,7 +796,7 @@ async function sendStart(id, msg, env) {
 
 // 正常态用户消息防线：敏感词与类型拦截器
 async function handleVerifiedMsg(msg, u, env) {
-    const id = u.user_id, text = msg.text || "";
+    const id = u.user_id, text = msg.text || msg.caption || "";
 
     // 如果用户之前被标记为屏蔽 Bot，但现在能发消息，说明已解除屏蔽
     if (u.user_info && u.user_info.bot_blocked) {
@@ -666,7 +815,7 @@ async function handleVerifiedMsg(msg, u, env) {
                     message_id: u.user_info.card_msg_id,
                     caption: newMeta.card,
                     parse_mode: "HTML",
-                    reply_markup: getBtns(id, u.is_blocked, newMeta.username)
+                    reply_markup: getBtns(id, u.is_blocked, newMeta.username, u.is_muted)
                 });
             }
         } catch (e) {
@@ -721,6 +870,33 @@ async function handleVerifiedMsg(msg, u, env) {
     await relayToTopic(msg, u, env);
 }
 
+async function acquireTopicLock(env, uid) {
+    const now = Date.now();
+    const staleBefore = now - TOPIC_LOCK_TIMEOUT_MS;
+    const result = await env.TG_BOT_DB.prepare(`
+        UPDATE users
+        SET topic_creating = 1, topic_lock_at = ?, updated_at = ?
+        WHERE user_id = ?
+          AND (topic_id IS NULL OR topic_id = '')
+          AND (topic_creating = 0 OR topic_creating IS NULL OR topic_lock_at IS NULL OR topic_lock_at < ?)
+    `).bind(now, Math.floor(now / 1000), uid, staleBefore).run();
+    return Number(result.meta?.changes || 0) === 1;
+}
+
+async function releaseTopicLock(env, uid) {
+    await sql(env, "UPDATE users SET topic_creating = 0, topic_lock_at = NULL, updated_at = ? WHERE user_id = ?", [Math.floor(Date.now() / 1000), uid]);
+}
+
+async function waitForExistingTopic(env, uid) {
+    for (let i = 0; i < 6; i++) {
+        await sleep(1000);
+        const fresh = await getUser(uid, env);
+        if (fresh.topic_id) return fresh.topic_id;
+        if (!fresh.topic_creating) return null;
+    }
+    return null;
+}
+
 // --- 核心：消息转发与话题流控引擎 ---
 async function relayToTopic(msg, u, env) {
     const uMeta = getUMeta(msg.from, u, msg.date), uid = u.user_id;
@@ -733,26 +909,42 @@ async function relayToTopic(msg, u, env) {
 
     // 2. 线程池资源申请：建立独立话题
     if (!tid) {
-        if (CACHE.user_locks[uid]) return;
+        if (CACHE.user_locks[uid]) {
+            tid = await waitForExistingTopic(env, uid);
+            if (!tid) return api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "系统忙，请稍后再试" });
+        }
+    }
+
+    if (!tid) {
         CACHE.user_locks[uid] = true;
+        let locked = false;
         try {
             const freshU = await getUser(uid, env);
             if (freshU.topic_id) tid = freshU.topic_id;
             else {
+                locked = await acquireTopicLock(env, uid);
+                if (!locked) {
+                    tid = await waitForExistingTopic(env, uid);
+                    if (!tid) return api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "系统忙，请稍后再试" });
+                }
+            }
+
+            if (!tid) {
                 const t = await api(env.BOT_TOKEN, "createForumTopic", { chat_id: env.ADMIN_GROUP_ID, name: uMeta.topicName });
                 tid = t.message_thread_id.toString();
                 u.user_info.card_msg_id = null;
                 u.user_info.topic_name = uMeta.topicName;
                 const dummy = await api(env.BOT_TOKEN, "sendMessage", { chat_id: env.ADMIN_GROUP_ID, message_thread_id: tid, text: "✨ 正在加载用户资料...", disable_notification: true });
                 u.user_info.dummy_msg_id = dummy.message_id;
-                await updUser(uid, { topic_id: tid, user_info: u.user_info }, env);
+                await updUser(uid, { topic_id: tid, topic_creating: false, topic_lock_at: null, user_info: u.user_info }, env);
             }
         } catch (e) {
             console.error("Topic Creation Failed:", e);
-            delete CACHE.user_locks[uid];
+            if (locked) await releaseTopicLock(env, uid).catch(() => {});
             return api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "系统忙，请稍后再试" });
+        } finally {
+            delete CACHE.user_locks[uid];
         }
-        delete CACHE.user_locks[uid];
     }
 
     try {
@@ -819,7 +1011,7 @@ async function relayToTopic(msg, u, env) {
 
         // 构建映射关联池，支撑双向回复寻址
         if (forwardedMsg && forwardedMsg.message_id) {
-            const storeText = msg.text || "[Media]";
+            const storeText = msg.text || msg.caption || "[Media]";
             await sql(env, "INSERT OR REPLACE INTO messages (user_id, message_id, text, date, topic_message_id) VALUES (?,?,?,?,?)",
                 [uid, msg.message_id.toString(), storeText, msg.date, forwardedMsg.message_id.toString()]);
         }
@@ -830,7 +1022,7 @@ async function relayToTopic(msg, u, env) {
     } catch (e) {
         console.error("Relay Failed:", e);
         if (e.message && (e.message.includes("thread") || e.message.includes("not found") || e.message.includes("Bad Request"))) {
-            await updUser(uid, { topic_id: null }, env); u.topic_id = null; return relayToTopic(msg, u, env);
+            await updUser(uid, { topic_id: null, topic_creating: false, topic_lock_at: null }, env); u.topic_id = null; return relayToTopic(msg, u, env);
         } else {
             await api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "❌ 发送失败，系统异常" });
         }
@@ -882,12 +1074,12 @@ async function sendInfoCardToTopic(env, u, tgUser, tid, date) {
         if (bestPhoto && !isCaptionTooLong) {
             try {
                 cardMsg = await api(env.BOT_TOKEN, "sendPhoto", {
-                    chat_id: env.ADMIN_GROUP_ID, message_thread_id: tid, photo: bestPhoto, caption: meta.card, parse_mode: "HTML", reply_markup: getBtns(u.user_id, u.is_blocked, meta.username)
+                    chat_id: env.ADMIN_GROUP_ID, message_thread_id: tid, photo: bestPhoto, caption: meta.card, parse_mode: "HTML", reply_markup: getBtns(u.user_id, u.is_blocked, meta.username, u.is_muted)
                 });
             } catch (err) {
                 if (err.message && (err.message.includes("parse") || err.message.includes("MEDIA"))) {
                     cardMsg = await api(env.BOT_TOKEN, "sendMessage", {
-                        chat_id: env.ADMIN_GROUP_ID, message_thread_id: tid, text: meta.card, parse_mode: "HTML", reply_markup: getBtns(u.user_id, u.is_blocked, meta.username)
+                        chat_id: env.ADMIN_GROUP_ID, message_thread_id: tid, text: meta.card, parse_mode: "HTML", reply_markup: getBtns(u.user_id, u.is_blocked, meta.username, u.is_muted)
                     });
                 } else {
                     throw err;
@@ -895,7 +1087,7 @@ async function sendInfoCardToTopic(env, u, tgUser, tid, date) {
             }
         } else {
             cardMsg = await api(env.BOT_TOKEN, "sendMessage", {
-                chat_id: env.ADMIN_GROUP_ID, message_thread_id: tid, text: meta.card, parse_mode: "HTML", reply_markup: getBtns(u.user_id, u.is_blocked, meta.username)
+                chat_id: env.ADMIN_GROUP_ID, message_thread_id: tid, text: meta.card, parse_mode: "HTML", reply_markup: getBtns(u.user_id, u.is_blocked, meta.username, u.is_muted)
             });
         }
         try { await api(env.BOT_TOKEN, "pinChatMessage", { chat_id: env.ADMIN_GROUP_ID, message_id: cardMsg.message_id, message_thread_id: tid }); } catch (pinErr) {}
@@ -907,6 +1099,57 @@ async function sendInfoCardToTopic(env, u, tgUser, tid, date) {
         }
         return null;
     }
+}
+
+async function rebuildInfoCard(env, uid, topicId) {
+    const u = await getUser(uid, env);
+    const tid = topicId || u.topic_id;
+    if (!tid) return null;
+
+    const tgUser = {
+        id: uid,
+        username: u.user_info.username || "",
+        first_name: u.user_info.name || "(未获取)",
+        last_name: ""
+    };
+    const oldCardId = u.user_info.card_msg_id;
+    const cardId = await sendInfoCardToTopic(env, u, tgUser, tid, u.user_info.join_date || (Date.now() / 1000));
+    if (!cardId) return null;
+
+    if (oldCardId && oldCardId !== cardId) {
+        await api(env.BOT_TOKEN, "deleteMessage", {
+            chat_id: env.ADMIN_GROUP_ID,
+            message_id: oldCardId
+        }).catch(() => {});
+    }
+
+    await updUser(uid, {
+        topic_id: tid,
+        user_info: { ...u.user_info, card_msg_id: cardId, join_date: u.user_info.join_date || (Date.now() / 1000) }
+    }, env);
+    return cardId;
+}
+
+async function refreshCardMarkup(env, uid) {
+    const u = await getUser(uid, env);
+    if (!u.user_info.card_msg_id) return;
+    await api(env.BOT_TOKEN, "editMessageReplyMarkup", {
+        chat_id: env.ADMIN_GROUP_ID,
+        message_id: u.user_info.card_msg_id,
+        reply_markup: getBtns(uid, u.is_blocked, u.user_info.username, u.is_muted)
+    }).catch((error) => {
+        if (!isMessageNotModified(error)) console.log("Refresh card markup failed:", error.message);
+    });
+}
+
+async function setUserBlocked(env, uid, isBlocked) {
+    const u = await getUser(uid, env);
+    if (!isBlocked && u.user_info.bot_blocked) {
+        u.user_info.bot_blocked = false;
+        delete u.user_info.bot_blocked_ts;
+    }
+    await updUser(uid, { is_blocked: isBlocked, block_count: 0, user_info: u.user_info }, env);
+    await refreshCardMarkup(env, uid);
 }
 
 // --- 5. 通用/黑名单 (管理黑名单控制域) ---
@@ -1085,9 +1328,9 @@ async function handleAdminReply(msg, env) {
             // 更新带有新附注的资料实体卡片
             if (u.topic_id && u.user_info.card_msg_id) {
                 try {
-                    await api(env.BOT_TOKEN, "editMessageCaption", { chat_id: env.ADMIN_GROUP_ID, message_id: u.user_info.card_msg_id, caption: newMeta.card, parse_mode: "HTML", reply_markup: getBtns(targetUid, u.is_blocked, newMeta.username) });
+                    await api(env.BOT_TOKEN, "editMessageCaption", { chat_id: env.ADMIN_GROUP_ID, message_id: u.user_info.card_msg_id, caption: newMeta.card, parse_mode: "HTML", reply_markup: getBtns(targetUid, u.is_blocked, newMeta.username, u.is_muted) });
                 } catch (e) {
-                    try { await api(env.BOT_TOKEN, "editMessageText", { chat_id: env.ADMIN_GROUP_ID, message_id: u.user_info.card_msg_id, text: newMeta.card, parse_mode: "HTML", reply_markup: getBtns(targetUid, u.is_blocked, newMeta.username) }); } catch(e2) {}
+                    try { await api(env.BOT_TOKEN, "editMessageText", { chat_id: env.ADMIN_GROUP_ID, message_id: u.user_info.card_msg_id, text: newMeta.card, parse_mode: "HTML", reply_markup: getBtns(targetUid, u.is_blocked, newMeta.username, u.is_muted) }); } catch(e2) {}
                 }
             }
             await updUser(targetUid, { user_info: u.user_info }, env);
@@ -1178,7 +1421,7 @@ async function handleAdminReply(msg, env) {
                                 message_id: u.user_info.card_msg_id,
                                 caption: newMeta.card,
                                 parse_mode: "HTML",
-                                reply_markup: getBtns(uid, u.is_blocked, newMeta.username)
+                                reply_markup: getBtns(uid, u.is_blocked, newMeta.username, u.is_muted)
                             });
                         } catch (editErr) {
                             console.log("Failed to update card after bot_blocked detection:", editErr.message);
@@ -1326,25 +1569,23 @@ async function handleCallback(cb, env) {
         }
         await api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id });
         if (act === 'pin_card') await api(env.BOT_TOKEN, "pinChatMessage", { chat_id: msg.chat.id, message_id: msg.message_id, message_thread_id: msg.message_thread_id });
+        else if (act === 'refresh_card') {
+            const cardId = await rebuildInfoCard(env, p1, msg.message_thread_id?.toString());
+            await api(env.BOT_TOKEN, "sendMessage", { chat_id: msg.chat.id, message_thread_id: msg.message_thread_id, text: cardId ? "✅ 资料卡已刷新" : "❌ 资料卡刷新失败" });
+        }
+        else if (['mute','unmute'].includes(act)) {
+            const muted = act === 'mute';
+            const uid = p1;
+            await updUser(uid, { is_muted: muted }, env);
+            await refreshCardMarkup(env, uid);
+            await api(env.BOT_TOKEN, "sendMessage", { chat_id: msg.chat.id, message_thread_id: msg.message_thread_id, text: muted ? "🔕 已静音" : "🔔 已取消静音" });
+        }
         else if (['block','unblock'].includes(act)) {
-            const isB = act === 'block'; const uid = p1; const u = await getUser(uid, env); const bid = await getCfg('blocked_topic_id', env);
-            await updUser(uid, { is_blocked: isB, block_count: 0 }, env);
-
-            // 如果是解封操作，清除 bot_blocked 标记
-            if (!isB && u.user_info.bot_blocked) {
-                u.user_info.bot_blocked = false;
-                delete u.user_info.bot_blocked_ts;
-                await updUser(uid, { user_info: u.user_info }, env);
-                console.log(`Cleared bot_blocked mark for user ${uid} after admin unblock`);
-            }
-
-            // 响应变更，刷新目标人员资料卡片上的按钮渲染状态
-            if (u.user_info.card_msg_id) {
-                api(env.BOT_TOKEN, "editMessageReplyMarkup", { chat_id: env.ADMIN_GROUP_ID, message_id: u.user_info.card_msg_id, reply_markup: getBtns(uid, isB, u.user_info.username) }).catch(()=>{});
-            }
-            await manageBlacklist(env, u, { id: uid, username: u.user_info.username, first_name: u.user_info.name }, isB);
-            if (!isB && msg.message_thread_id && bid && msg.message_thread_id.toString() === bid) await api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "✅ 已解除屏蔽" });
-            else await api(env.BOT_TOKEN, "sendMessage", { chat_id: msg.chat.id, message_thread_id: msg.message_thread_id, text: isB ? "❌ 已屏蔽" : "✅ 已解封" });
+            const isB = act === 'block'; const uid = p1;
+            await setUserBlocked(env, uid, isB);
+            const fresh = await getUser(uid, env);
+            await manageBlacklist(env, fresh, { id: uid, username: fresh.user_info.username, first_name: fresh.user_info.name }, isB);
+            await api(env.BOT_TOKEN, "sendMessage", { chat_id: msg.chat.id, message_thread_id: msg.message_thread_id, text: isB ? "❌ 已屏蔽" : "✅ 已解封" });
         }
     }
 }
@@ -1362,7 +1603,7 @@ async function handleAdminConfig(cid, mid, type, key, val, env) {
                 return render(`基础配置\n验证码模式: ${statusText}\n问题验证: ${qaOn?"✅":"❌"}`, { inline_keyboard: [[{text:"欢迎语",callback_data:"config:edit:welcome_msg"},{text:"问题",callback_data:"config:edit:verif_q"},{text:"答案",callback_data:"config:edit:verif_a"}], [{text: `验证码模式: ${statusText} (点击切换)`, callback_data:`config:rotate_mode`}], [{text: `问题验证: ${qaOn?"✅ 开启":"❌ 关闭"}`, callback_data:`config:toggle:enable_qa_verify:${!qaOn}`}], [back]] });
             }
             if (key === 'fl') return render("🛠 <b>过滤设置</b>", await getFilterKB(env));
-            if (['ar','kw','auth'].includes(key)) return render(`列表: ${key}`, await getListKB(key, env));
+            if (['ar','kw','auth'].includes(key)) return render(`列表: ${key}`, await getListKB(key, env, Number(val || 0)));
             if (key === 'bak') {
                 const bid = await getCfg('backup_group_id', env), blk = await getCfg('blocked_topic_id', env);
                 return render(`💾 <b>备份与通知</b>\n备份群: ${bid||"无"}\n黑名单话题: ${blk?`✅ (${blk})`:"⏳"}`, { inline_keyboard: [[{text:"设备份群",callback_data:"config:edit:backup_group_id"},{text:"清备份",callback_data:"config:cl:backup_group_id"}],[{text:"重置黑名单",callback_data:"config:cl:blocked_topic_id"}],[back]] });
@@ -1375,7 +1616,15 @@ async function handleAdminConfig(cid, mid, type, key, val, env) {
         if (type === 'toggle') { await setCfg(key, val, env); return key==='busy_mode' ? handleAdminConfig(cid,mid,'menu','busy',null,env) : (key==='enable_qa_verify' ? handleAdminConfig(cid,mid,'menu','base',null,env) : render("🛠 <b>过滤设置</b>", await getFilterKB(env))); }
         if (type === 'cl') { await setCfg(key, key==='authorized_admins'?'[]':'', env); return handleAdminConfig(cid, mid, 'menu', key==='blocked_topic_id'?'bak':(key==='authorized_admins'?'auth':'bak'), null, env); }
         if (type === 'del') {
-            const realK = key==='kw'?'block_keywords':(key==='auth'?'authorized_admins':'keyword_responses'); let l = await getJsonCfg(realK, env); l = l.filter(i => (i.id||i).toString() !== val); await setCfg(realK, JSON.stringify(l), env); return render(`列表: ${key}`, await getListKB(key, env));
+            const realK = key==='kw'?'block_keywords':(key==='auth'?'authorized_admins':'keyword_responses');
+            let l = await getJsonCfg(realK, env);
+            if (key === 'ar') l = l.filter(i => (i.id || "").toString() !== val);
+            else {
+                const index = Number(val);
+                l = Number.isInteger(index) ? l.filter((_, i) => i !== index) : l.filter(i => (i.id||i).toString() !== val);
+            }
+            await setCfg(realK, JSON.stringify(l), env);
+            return render(`列表: ${key}`, await getListKB(key, env));
         }
         if (type === 'edit' || type === 'add') {
             await setCfg(`admin_state:${cid}`, JSON.stringify({ action: 'input', key: key + (type==='add'?'_add':'') }), env);
@@ -1399,10 +1648,25 @@ async function getFilterKB(env) {
     return { inline_keyboard: [[b("回执", keys[0], vals[0]), b("转发", keys[1], vals[1])], [b("媒体", keys[2], vals[2]), b("语音", keys[3], vals[3])], [b("贴纸", keys[4], vals[4]), b("链接", keys[5], vals[5])], [b("频道", keys[6], vals[6]), b("文本", keys[7], vals[7])], [{ text: "🔙 返回", callback_data: "config:menu" }]] };
 }
 
-async function getListKB(type, env) {
+async function getListKB(type, env, page = 0) {
     const k = type==='ar'?'keyword_responses':(type==='kw'?'block_keywords':'authorized_admins');
     const l = await getJsonCfg(k, env);
-    const btns = l.map((i, idx) => [{ text: `🗑 ${type==='ar'?i.keywords:i}`, callback_data: `config:del:${type}:${i.id||i}` }]);
+    const list = Array.isArray(l) ? l : [];
+    const totalPages = Math.max(1, Math.ceil(list.length / RULE_PAGE_SIZE));
+    const currentPage = Math.min(Math.max(Math.floor(page) || 0, 0), totalPages - 1);
+    const start = currentPage * RULE_PAGE_SIZE;
+    const pageItems = list.slice(start, start + RULE_PAGE_SIZE);
+    const btns = pageItems.map((i, idx) => {
+        const absoluteIndex = start + idx;
+        const label = type === 'ar' ? i.keywords : i;
+        const preview = Array.from(String(label || "")).slice(0, 24).join("");
+        const deleteKey = type === 'ar' ? (i.id || absoluteIndex) : absoluteIndex;
+        return [{ text: `🗑 ${absoluteIndex + 1}. ${preview}`, callback_data: `config:del:${type}:${deleteKey}` }];
+    });
+    const nav = [];
+    if (currentPage > 0) nav.push({ text: "⬅️ 上一页", callback_data: `config:menu:${type}:${currentPage - 1}` });
+    if (currentPage < totalPages - 1) nav.push({ text: "下一页 ➡️", callback_data: `config:menu:${type}:${currentPage + 1}` });
+    if (nav.length) btns.push(nav);
     btns.push([{ text: "➕ 添加", callback_data: `config:add:${type}` }], [{ text: "🔙 返回", callback_data: "config:menu" }]);
     return { inline_keyboard: btns };
 }
@@ -1472,6 +1736,12 @@ function parseDelCommand(raw) {
     return { type: "invalid" };
 }
 
+function parseAdminCommand(raw) {
+    const s = (raw || "").trim();
+    const match = s.match(/^\/(ban|unban|card|terminate)(?:@[a-z0-9_]+)?(?:\s+(-?\d+))?\s*$/i);
+    return match ? { command: match[1].toLowerCase(), arg: match[2] || "" } : null;
+}
+
 function safeRegexTest(pattern, text) {
     try {
         if (!pattern || typeof pattern !== "string") return false;
@@ -1483,6 +1753,10 @@ function safeRegexTest(pattern, text) {
     } catch {
         return false;
     }
+}
+
+function isMessageNotModified(error) {
+    return String(error?.message || "").toLowerCase().includes("message is not modified");
 }
 
 function isTelegramWebhook(req, env) {
@@ -1535,6 +1809,10 @@ async function verifyTelegramInitData(initData, botToken, maxAgeSec = 600) {
     const user = safeParse(params.get("user"), null);
     return user?.id ? { userId: user.id.toString(), user } : null;
 };
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 // HTML `<a>` 标签组装逻辑：穿透安全审查拦截，对无用户名账号建立伪链接
 const getUMeta = (tgUser, dbUser, d) => {
@@ -1602,7 +1880,7 @@ async function syncTopicProfile(u, tgUser, env) {
 }
 
 // 动态键盘矩阵构建：受限 API 规避检查点
-const getBtns = (id, blk, username) => {
+const getBtns = (id, blk, username, muted = false) => {
     const btns = [];
 
     // username 条件控制路由：缺少公开标识符强制屏蔽按钮注册
@@ -1611,6 +1889,7 @@ const getBtns = (id, blk, username) => {
     }
 
     btns.push([{ text: blk ? "✅ 执行解封" : "🚫 执行屏蔽", callback_data: `${blk ? 'unblock' : 'block'}:${id}` }]);
+    btns.push([{ text: muted ? "🔔 取消静音" : "🔕 静音", callback_data: `${muted ? 'unmute' : 'mute'}:${id}` }, { text: "🔄 刷新资料卡", callback_data: `refresh_card:${id}` }]);
     btns.push([{ text: "✏️ 录入备注", callback_data: `note:set:${id}` }, { text: "📌 提升置顶", callback_data: `pin_card:${id}` }]);
 
     return { inline_keyboard: btns };
