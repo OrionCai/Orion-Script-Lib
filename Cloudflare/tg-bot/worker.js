@@ -93,7 +93,7 @@ export default {
             }
         } catch (e) {
             console.error("Critical Worker Error:", e);
-            return new Response("Internal Server Error", { status: 500 });
+            return new Response(`Internal Server Error: ${e?.message || e}`, { status: 500 });
         }
         return new Response("404 Not Found", { status: 404 });
     }
@@ -195,23 +195,35 @@ async function migrateDb(env) {
         env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)`),
         env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS users (user_id TEXT PRIMARY KEY, user_state TEXT DEFAULT 'new', is_blocked INTEGER DEFAULT 0, is_muted INTEGER DEFAULT 0, block_count INTEGER DEFAULT 0, first_message_sent INTEGER DEFAULT 0, topic_id TEXT, topic_creating INTEGER DEFAULT 0, topic_lock_at INTEGER, user_info_json TEXT, updated_at INTEGER)`),
         env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS messages (user_id TEXT, message_id TEXT, text TEXT, date INTEGER, topic_message_id TEXT, PRIMARY KEY (user_id, message_id))`),
-        env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS processed_updates (update_id TEXT PRIMARY KEY, processed_at INTEGER NOT NULL)`),
-        env.TG_BOT_DB.prepare(`CREATE INDEX IF NOT EXISTS idx_users_topic_id ON users(topic_id)`),
-        env.TG_BOT_DB.prepare(`CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date)`),
-        env.TG_BOT_DB.prepare(`CREATE INDEX IF NOT EXISTS idx_processed_updates_time ON processed_updates(processed_at)`)
+        env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS processed_updates (update_id TEXT PRIMARY KEY, processed_at INTEGER NOT NULL)`)
     ]);
-    await ensureUserColumn(env, "is_muted", "INTEGER DEFAULT 0");
-    await ensureUserColumn(env, "topic_creating", "INTEGER DEFAULT 0");
-    await ensureUserColumn(env, "topic_lock_at", "INTEGER");
-    await ensureUserColumn(env, "updated_at", "INTEGER");
+    await ensureColumn(env, "users", "is_muted", "INTEGER DEFAULT 0");
+    await ensureColumn(env, "users", "topic_creating", "INTEGER DEFAULT 0");
+    await ensureColumn(env, "users", "topic_lock_at", "INTEGER");
+    await ensureColumn(env, "users", "updated_at", "INTEGER");
+    await ensureColumn(env, "messages", "topic_message_id", "TEXT");
+    await ensureColumn(env, "processed_updates", "processed_at", "INTEGER DEFAULT 0");
+    await safeDbRun(env, `CREATE INDEX IF NOT EXISTS idx_users_topic_id ON users(topic_id)`);
+    await safeDbRun(env, `CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date)`);
+    await safeDbRun(env, `CREATE INDEX IF NOT EXISTS idx_processed_updates_time ON processed_updates(processed_at)`);
 }
 
-async function ensureUserColumn(env, columnName, definition) {
+async function ensureColumn(env, tableName, columnName, definition) {
     try {
-        await env.TG_BOT_DB.prepare(`ALTER TABLE users ADD COLUMN ${columnName} ${definition}`).run();
+        await env.TG_BOT_DB.prepare(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`).run();
     } catch (error) {
         const message = String(error?.message || error).toLowerCase();
-        if (!message.includes("duplicate column") && !message.includes("already exists")) throw error;
+        if (!message.includes("duplicate column") && !message.includes("already exists")) {
+            console.warn(`Skip migration column ${tableName}.${columnName}:`, error?.message || error);
+        }
+    }
+}
+
+async function safeDbRun(env, query) {
+    try {
+        await env.TG_BOT_DB.prepare(query).run();
+    } catch (error) {
+        console.warn(`Skip migration query [${query}]:`, error?.message || error);
     }
 }
 
