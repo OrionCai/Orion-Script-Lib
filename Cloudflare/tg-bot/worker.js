@@ -1052,6 +1052,8 @@ async function ensureInfoCardBeforeRelay(env, u, tgUser, tid, date) {
             u.user_info.join_date = date || (Date.now()/1000);
             infoDirty = true;
         }
+    } else {
+        await updateInfoCardInPlace(env, u, tgUser, date);
     }
 
     // 回收临时占位符提升界面整洁度；先发卡片再删占位，确保新 topic 里卡片始终早于用户消息。
@@ -1062,6 +1064,32 @@ async function ensureInfoCardBeforeRelay(env, u, tgUser, tid, date) {
     }
 
     if (infoDirty) await updUser(u.user_id, { user_info: u.user_info }, env);
+}
+
+async function updateInfoCardInPlace(env, u, tgUser, date) {
+    if (!u?.user_info?.card_msg_id) return false;
+    const meta = getUMeta(tgUser, u, date || u.user_info.join_date || (Date.now() / 1000));
+    const common = {
+        chat_id: env.ADMIN_GROUP_ID,
+        message_id: u.user_info.card_msg_id,
+        parse_mode: "HTML",
+        reply_markup: getBtns(u.user_id, u.is_blocked, meta.username, u.is_muted)
+    };
+
+    try {
+        await api(env.BOT_TOKEN, "editMessageCaption", { ...common, caption: meta.card });
+        return true;
+    } catch (captionError) {
+        if (!isMessageNotModified(captionError)) {
+            try {
+                await api(env.BOT_TOKEN, "editMessageText", { ...common, text: meta.card });
+                return true;
+            } catch (textError) {
+                if (!isMessageNotModified(textError)) console.log("Update info card in place failed:", textError.message);
+            }
+        }
+    }
+    return false;
 }
 
 // --- 核心：发送用户信息复合卡片 ---
