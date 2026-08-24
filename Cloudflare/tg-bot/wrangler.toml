@@ -30,18 +30,3 @@ ADMIN_IDS = "1050736994"
 RECAPTCHA_SITE_KEY = "6LcUay8sAAAAACLnMIWa7hPQ3xeqpTpwkVrcH1lA"
 TURNSTILE_SITE_KEY = "0x4AAAAAACHWTN2-fNAVuHWc"
 WORKER_URL = "https://tgbot.orionc.me"
-
-[observability]
-enabled = false
-head_sampling_rate = 1
-
-[observability.logs]
-enabled = true
-head_sampling_rate = 1
-persist = true
-invocation_logs = true
-
-[observability.traces]
-enabled = false
-persist = true
-head_sampling_rate = 1
