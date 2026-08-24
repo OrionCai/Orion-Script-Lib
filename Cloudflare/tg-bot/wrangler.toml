@@ -1,0 +1,32 @@
+# Cloudflare/tg-bot/wrangler.toml
+name = "tg-bot"
+main = "worker.js"
+compatibility_date = "2026-08-24"
+keep_vars = true
+
+[[d1_databases]]
+binding = "TG_BOT_DB"
+database_name = "tg-bot-db"
+database_id = "95abaa8c-9c8b-4912-ae1a-3cfa2827f583"
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
+
+[vars]
+ADMIN_GROUP_ID = "-1003901293118"
+ADMIN_IDS = "1050736994"
+RECAPTCHA_SITE_KEY = "6LcUay8sAAAAACLnMIWa7hPQ3xeqpTpwkVrcH1lA"
+TURNSTILE_SITE_KEY = "0x4AAAAAACHWTN2-fNAVuHWc"
+WORKER_URL = "https://tgbot.orionc.me"
