@@ -7,7 +7,7 @@ Surge 模块，用于把 `t.me` 和 `telegram.me` 链接重定向到指定 Teleg
 在 Surge 中通过模块 URL 添加：
 
 ```text
-https://raw.orionc.me/proxy/module/surge/telegram/Telegram.sgmodule?token=orion-raw-19990126
+https://raw.githubusercontent.com/OrionG-hub/Script-Lib/refs/heads/master/module/surge/telegram/Telegram.sgmodule
 ```
 
 启用模块后按需修改参数 `CLIENT`。
