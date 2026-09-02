@@ -4,6 +4,6 @@
 #!arguments=CLIENT:Telegram
 #!arguments-desc=填写客户端名称；选择 Telegram 时保持原链接，不进行重定向。
 [Script]
-Telegram 链接重定向 = type=http-request, pattern=^https?://(?:t\.me|telegram\.me)/.+, script-path=https://raw.orionc.me/proxy/module/surge/js/TgRedirect.surge.js?token=orion-raw-19990126, timeout=10, argument="{{{CLIENT}}}"
+Telegram 链接重定向 = type=http-request, pattern=^https?://(?:t\.me|telegram\.me)/.+, script-path=https://raw.orionc.me/proxy/module/surge/telegram/js/Telegram.sgmodule?token=orion-raw-19990126, timeout=10, argument="{{{CLIENT}}}"
 [MITM]
 hostname = %APPEND% t.me, telegram.me
