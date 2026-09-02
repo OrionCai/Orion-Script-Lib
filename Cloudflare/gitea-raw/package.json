@@ -1,0 +1,17 @@
+{
+  "name": "gitea-raw-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "test": "npm run test:unit && npm run test:integration",
+    "test:unit": "node --test --test-name-pattern='^unit:' worker.test.js",
+    "test:integration": "node --test --test-name-pattern='^integration:' worker.test.js",
+    "coverage": "node --test --experimental-test-coverage --test-coverage-include=worker.js worker.test.js"
+  },
+  "devDependencies": {
+    "wrangler": "^4.108.0"
+  }
+}
