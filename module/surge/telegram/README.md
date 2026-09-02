@@ -22,6 +22,7 @@ https://raw.githubusercontent.com/OrionG-hub/Script-Lib/refs/heads/master/module
 
 - `Telegram`
 - `Nagram`
+- `NyuGram`
 - `Swiftgram`
 - `Turrit`
 - `iMe`

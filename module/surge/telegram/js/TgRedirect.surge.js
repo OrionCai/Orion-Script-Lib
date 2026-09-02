@@ -6,6 +6,7 @@
 const SCHEME = {
   Telegram: "tg",
   Nagram: "tg",
+  NyuGram: "nyugram",
   Swiftgram: "sg",
   Turrit: "turrit",
   iMe: "ime",
